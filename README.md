@@ -6,6 +6,7 @@ A personal pocket sampler for Android — record anything, chop it onto pads, se
 
 ## What it does
 
+- **CHOP lab — field recording → slices** (v2): record a walk up to **6 minutes** (or import a long file), see the whole waveform, zoom/pan, tap to audition any slice, **AUTO-SLICE** detects sound events (sensitivity slider), GRID cuts equal divisions, drag markers to fine-tune (hold to delete), then **→ PADS** spreads the slices across empty pads to play with. Full recording can also go to a single pad or straight out as a WAV (city-sound archive). The recording survives app restarts.
 - **64 pads** (4 banks × 16) — tap `●` then a pad to sample from the mic; `IMPORT` loads audio files
 - **Per-pad editing** — trim with draggable handles, gain, pitch (±12 st), pan, one-shot/gate/loop, reverse, normalize, crop, choke groups, copy/paste
 - **Keyboard mode** — play the selected pad chromatically or in a scale across the 16 pads

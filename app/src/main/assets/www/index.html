@@ -98,6 +98,15 @@
   .ebtn.on{background:var(--acc2);border-color:var(--acc2);color:#0b0d12;font-weight:700;}
   .ebtn.danger{color:var(--rec);}
 
+  /* ---------- chop page ---------- */
+  #chopTop{display:flex;gap:6px;padding:8px 10px 0;flex-wrap:wrap;}
+  #chopWaveBox{position:relative;flex:1;min-height:150px;margin:10px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;overflow:hidden;touch-action:none;}
+  #chopCanvas{width:100%;height:100%;display:block;}
+  #chTime{position:absolute;top:6px;right:10px;font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums;pointer-events:none;}
+  #chopBtns{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:0 10px;}
+  #chopHint{padding:8px 12px;font-size:11px;color:var(--dim);text-align:center;}
+  #chRec.rec{background:var(--rec);border-color:var(--rec);color:#fff;animation:blink 1s steps(2) infinite;}
+
   /* ---------- menu drawer ---------- */
   #menu{position:absolute;inset:0;background:rgba(5,7,10,.72);display:none;z-index:30;}
   #menu.on{display:block;}
@@ -142,6 +151,7 @@
   <div id="resampleBar"><span>RESAMPLING — playing output is being captured…</span><button id="btnResampleStop">STOP</button></div>
   <div id="tabs">
     <div class="tab on" data-page="pads">PADS</div>
+    <div class="tab" data-page="chop">CHOP</div>
     <div class="tab" data-page="seq">SEQ</div>
     <div class="tab" data-page="fx">FX</div>
     <div class="tab" data-page="edit">EDIT</div>
@@ -151,6 +161,25 @@
       <div id="bankRow"></div>
       <div id="padGrid"></div>
       <div id="padHint">tap ● then a pad to sample from the mic · long-press a pad to select it for EDIT</div>
+    </div>
+    <div class="page" id="page-chop">
+      <div id="chopTop">
+        <button class="seq-ctl" id="chRec">● REC</button>
+        <button class="seq-ctl" id="chImport">IMPORT</button>
+        <button class="seq-ctl" id="chAuto">AUTO-SLICE</button>
+        <button class="seq-ctl" id="chGrid">GRID 8</button>
+        <button class="seq-ctl" id="chClear">CLEAR</button>
+      </div>
+      <div id="chopWaveBox"><canvas id="chopCanvas"></canvas><div id="chTime"></div></div>
+      <div class="ctlRow" style="padding:0 12px"><label>zoom</label><input type="range" id="chZoom" min="0" max="100" value="0"><output id="chZoomOut">1×</output></div>
+      <div class="ctlRow" style="padding:0 12px"><label>sens</label><input type="range" id="chSens" min="0" max="100" value="50"><output id="chSensOut">50</output></div>
+      <div id="chopBtns">
+        <button class="ebtn" id="chAdd">＋ MARKER</button>
+        <button class="ebtn" id="chToPads">→ PADS</button>
+        <button class="ebtn" id="chKeep">FULL → PAD</button>
+        <button class="ebtn" id="chExport">⬇ WAV</button>
+      </div>
+      <div id="chopHint">record a walk (up to 6 min) · tap wave = audition slice · drag marker = move · hold marker = delete</div>
     </div>
     <div class="page" id="page-seq">
       <div id="seqTop"></div>

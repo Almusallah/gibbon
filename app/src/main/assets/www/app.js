@@ -10,7 +10,7 @@ const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const NUM_BANKS = 4, PADS_PER_BANK = 16, NUM_PADS = NUM_BANKS * PADS_PER_BANK;
 const NUM_PATTERNS = 6;
 const SCALES = { chrom: [0,1,2,3,4,5,6,7,8,9,10,11], major: [0,2,4,5,7,9,11], minor: [0,2,3,5,7,8,10], pmin: [0,3,5,7,10], pmaj: [0,2,4,7,9] };
-const VERSION = 'v1';
+const VERSION = 'v2';
 
 /* ------------------------------------------------ state */
 const S = {
@@ -241,12 +241,13 @@ async function ensureMic() {
 }
 
 function onCapChunk(d, from) {
-  if (recTarget < 0) return;
+  if (recTarget === -1) return;
   if (recKind !== (from || 'master')) return;
   recChunks.push(d); recLen += d.L.length;
   let peak = 0; for (let i = 0; i < d.L.length; i += 8) peak = Math.max(peak, Math.abs(d.L[i]));
   $('#meter').style.width = Math.min(100, peak * 130) + '%';
-  if (recLen > ctx.sampleRate * 40) stopRecording(); // safety cap 40s
+  // safety caps: 40s for a pad, 6 min for a field recording in the chop lab
+  if (recLen > ctx.sampleRate * (recTarget === CHOP_TARGET ? 360 : 40)) stopRecording();
 }
 
 async function startMicRecording(padIdx) {
@@ -269,11 +270,12 @@ function startResample() {
 }
 
 function stopRecording() {
-  if (recTarget < 0) return;
+  if (recTarget === -1) return;
   const padIdx = recTarget; recTarget = -1;
   if (recKind === 'mic') recNode.port.postMessage('stop');
   else { master.cap.port.postMessage('stop'); $('#resampleBar').classList.remove('on'); }
   $('#meter').style.width = '0';
+  if (padIdx === CHOP_TARGET) { finalizeChopRecording(); return; }
   if (recLen < 256) { toast('Too short'); S.recordingPad = -1; drawPads(); return; }
   const buf = ctx.createBuffer(2, recLen, ctx.sampleRate);
   const L = buf.getChannelData(0), R = buf.getChannelData(1);
@@ -289,19 +291,281 @@ function stopRecording() {
 }
 
 /* ------------------------------------------------ import */
+let importDest = 'pad';
 $('#fileIn').addEventListener('change', async e => {
   const f = e.target.files[0]; e.target.value = '';
+  const dest = importDest; importDest = 'pad';
   if (!f) return;
   await ensureAudio();
   try {
     const ab = await f.arrayBuffer();
     const buf = await ctx.decodeAudioData(ab);
+    if (dest === 'chop') {
+      const mono = ctx.createBuffer(1, buf.length, buf.sampleRate);
+      const L = mono.getChannelData(0), a = buf.getChannelData(0);
+      const b = buf.numberOfChannels > 1 ? buf.getChannelData(1) : a;
+      for (let i = 0; i < buf.length; i++) L[i] = (a[i] + b[i]) / 2;
+      C.buf = mono; C.sr = buf.sampleRate; C.markers = []; C.z = 1; C.off = 0;
+      drawChop(); dirty(); saveChopSource();
+      toast('Loaded ' + fmtTime(buf.duration) + ' into the chop lab');
+      return;
+    }
     const p = S.pads[S.selPad];
     p.buf = buf; p.start = 0; p.end = 1; p.name = f.name.replace(/\.[^.]+$/, '').slice(0, 24);
     drawPads(); drawEdit(); dirty();
     toast('Imported → pad ' + padLabel(S.selPad));
   } catch (err) { toast('Could not decode this file'); }
 });
+
+/* ------------------------------------------------ chop lab (field recording → slices) */
+const CHOP_TARGET = -2;
+const C = { buf: null, sr: 44100, markers: [], z: 1, off: 0, lastTap: -1, playhead: -1, auditionSrc: null, playFrom: 0, playTo: 1, playStart: 0 };
+let chRecTimer = 0, gridSeq = [8, 16, 32, 4], gridPos = 0;
+const fmtTime = s => Math.floor(s / 60) + ':' + ('0' + Math.floor(s % 60)).slice(-2);
+
+async function startChopRecording() {
+  await ensureAudio();
+  try { await ensureMic(); } catch (e) { toast('Microphone unavailable: ' + e.message); return; }
+  recKind = 'mic'; recChunks = []; recLen = 0; recTarget = CHOP_TARGET;
+  recNode.port.postMessage('start');
+  const b = $('#chRec'); b.classList.add('rec');
+  chRecTimer = setInterval(() => { b.textContent = '● ' + fmtTime(recLen / ctx.sampleRate); }, 250);
+  toast('Recording — walk around, tap ● to stop (max 6:00)');
+}
+function finalizeChopRecording() {
+  clearInterval(chRecTimer);
+  const b = $('#chRec'); b.classList.remove('rec'); b.textContent = '● REC';
+  if (recLen < ctx.sampleRate * .2) { toast('Too short'); recChunks = []; return; }
+  const buf = ctx.createBuffer(1, recLen, ctx.sampleRate);
+  const L = buf.getChannelData(0); let o = 0;
+  for (const c of recChunks) { L.set(c.L, o); o += c.L.length; }
+  recChunks = [];
+  C.buf = buf; C.sr = ctx.sampleRate; C.markers = []; C.z = 1; C.off = 0; C.lastTap = -1;
+  $('#chZoom').value = 0; $('#chZoomOut').textContent = '1×';
+  drawChop(); dirty(); saveChopSource();
+  toast('Captured ' + fmtTime(buf.duration) + ' — now slice it');
+}
+$('#chRec').onclick = () => { if (recTarget === CHOP_TARGET) stopRecording(); else startChopRecording(); };
+$('#chImport').onclick = () => { importDest = 'chop'; $('#fileIn').click(); };
+
+/* --- chop persistence: the long source is saved once per capture, not on every edit --- */
+async function saveChopSource() {
+  try {
+    const d = await idb();
+    const payload = C.buf ? { L: C.buf.getChannelData(0).slice(0), sr: C.sr } : null;
+    await new Promise((res, rej) => {
+      const tx = d.transaction('projects', 'readwrite');
+      tx.objectStore('projects').put(payload, '__chopsrc');
+      tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+    });
+  } catch (e) {}
+}
+async function loadChopSource() {
+  try {
+    const d = await idb();
+    const data = await new Promise(res => {
+      const rq = d.transaction('projects').objectStore('projects').get('__chopsrc');
+      rq.onsuccess = () => res(rq.result); rq.onerror = () => res(null);
+    });
+    if (!data || !ctx) return;
+    const buf = ctx.createBuffer(1, data.L.length, data.sr);
+    buf.getChannelData(0).set(data.L);
+    C.buf = buf; C.sr = data.sr;
+    drawChop();
+  } catch (e) {}
+}
+
+/* --- slicing --- */
+function sortedMarkers() { return [...C.markers].sort((a, b) => a - b); }
+function autoSlice() {
+  if (!C.buf) { toast('Record or import first'); return; }
+  const d = C.buf.getChannelData(0), sr = C.sr;
+  const hop = Math.floor(sr * .02), n = Math.floor(d.length / hop);
+  const rms = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let s = 0; const base = i * hop;
+    for (let j = 0; j < hop; j += 4) { const v = d[base + j]; s += v * v; }
+    rms[i] = Math.sqrt(s / (hop / 4));
+  }
+  const sens = +$('#chSens').value;               // higher = more slices
+  const k = 1.35 + (100 - sens) / 100 * 2.2;      // onset must exceed k× running average
+  const minGap = .25 + (100 - sens) / 100 * .75;  // seconds between onsets
+  const marks = []; let avg = rms[0] || 1e-4, last = -1e9;
+  for (let i = 2; i < n; i++) {
+    avg = avg * .95 + rms[i - 1] * .05;
+    if (rms[i] > avg * k && rms[i] > .01 && i * hop / sr - last > minGap) {
+      last = i * hop / sr;
+      marks.push(Math.max(0, i - 1) * hop / d.length);
+    }
+  }
+  C.markers = marks.filter(m => m > .002 && m < .998);
+  drawChop(); dirty();
+  toast(C.markers.length ? C.markers.length + 1 + ' slices found' : 'No clear events — raise sens or use GRID');
+}
+$('#chAuto').onclick = autoSlice;
+$('#chGrid').onclick = () => {
+  if (!C.buf) { toast('Record or import first'); return; }
+  const n = gridSeq[gridPos]; gridPos = (gridPos + 1) % gridSeq.length;
+  C.markers = []; for (let i = 1; i < n; i++) C.markers.push(i / n);
+  $('#chGrid').textContent = 'GRID ' + gridSeq[gridPos];
+  drawChop(); dirty(); toast(n + ' equal slices');
+};
+$('#chClear').onclick = () => { C.markers = []; C.lastTap = -1; drawChop(); dirty(); };
+$('#chAdd').onclick = () => {
+  if (!C.buf) return;
+  if (C.lastTap < 0) { toast('Tap the wave first to place the cursor'); return; }
+  C.markers.push(C.lastTap); drawChop(); dirty();
+};
+$('#chToPads').onclick = () => {
+  if (!C.buf) { toast('Record or import first'); return; }
+  const bs = [0, ...sortedMarkers(), 1], d = C.buf.getChannelData(0);
+  const slices = [];
+  for (let i = 0; i < bs.length - 1; i++) if (bs[i + 1] - bs[i] > .0005) slices.push([bs[i], bs[i + 1]]);
+  let assigned = 0, firstIdx = -1;
+  for (const [a, b] of slices) {
+    const idx = S.pads.findIndex(p => !p.buf);
+    if (idx < 0) break;
+    const s = Math.floor(a * d.length), e = Math.floor(b * d.length);
+    const nb = ctx.createBuffer(2, e - s, C.sr);
+    nb.getChannelData(0).set(d.subarray(s, e)); nb.getChannelData(1).set(d.subarray(s, e));
+    Object.assign(S.pads[idx], { buf: nb, name: 'cut' + (assigned + 1), start: 0, end: 1, gain: 1, pan: 0, semis: 0, mode: 'oneshot', choke: 0 });
+    if (firstIdx < 0) firstIdx = idx;
+    assigned++;
+  }
+  if (!assigned) { toast('No empty pads — clear some first'); return; }
+  S.selPad = firstIdx; S.bank = Math.floor(firstIdx / PADS_PER_BANK);
+  drawPads(); dirty();
+  toast(assigned + ' slices → pads' + (assigned < slices.length ? ' (' + (slices.length - assigned) + " didn't fit)" : ''));
+  gotoTab('pads');
+};
+$('#chKeep').onclick = () => {
+  if (!C.buf) { toast('Record or import first'); return; }
+  const idx = S.pads.findIndex(p => !p.buf);
+  if (idx < 0) { toast('No empty pads'); return; }
+  const d = C.buf.getChannelData(0), nb = ctx.createBuffer(2, d.length, C.sr);
+  nb.getChannelData(0).set(d); nb.getChannelData(1).set(d);
+  Object.assign(S.pads[idx], { buf: nb, name: 'field ' + fmtTime(C.buf.duration), start: 0, end: 1 });
+  S.selPad = idx; drawPads(); dirty();
+  toast('Full recording → pad ' + padLabel(idx));
+};
+$('#chExport').onclick = () => {
+  if (!C.buf) { toast('Record or import first'); return; }
+  const d = C.buf.getChannelData(0);
+  saveWav(encodeWav(d, d, C.sr), safeName(S.projName) + '-field.wav');
+};
+
+/* --- audition --- */
+function auditionAt(frac) {
+  const bs = [0, ...sortedMarkers(), 1];
+  let a = 0, b = 1;
+  for (let i = 0; i < bs.length - 1; i++) if (frac >= bs[i] && frac < bs[i + 1]) { a = bs[i]; b = bs[i + 1]; break; }
+  C.lastTap = frac;
+  if (C.auditionSrc) { try { C.auditionSrc.stop(); } catch (e) {} }
+  const src = ctx.createBufferSource();
+  src.buffer = C.buf; src.connect(master.in);
+  src.start(0, a * C.buf.duration, (b - a) * C.buf.duration);
+  C.auditionSrc = src; C.playStart = ctx.currentTime; C.playFrom = a; C.playTo = b;
+  src.onended = () => { if (C.auditionSrc === src) { C.auditionSrc = null; C.playhead = -1; drawChop(); } };
+  animateChopPlayhead();
+}
+function animateChopPlayhead() {
+  if (!C.auditionSrc) return;
+  C.playhead = C.playFrom + (ctx.currentTime - C.playStart) / C.buf.duration;
+  if (C.playhead >= C.playTo) { C.playhead = -1; drawChop(); return; }
+  drawChop();
+  requestAnimationFrame(animateChopPlayhead);
+}
+
+/* --- canvas + gestures --- */
+const chCanvas = $('#chopCanvas'), chCtx2 = chCanvas.getContext('2d');
+function chVisible() { return 1 / C.z; }
+function chXToFrac(px, rect) { return clamp(C.off + (px - rect.left) / rect.width * chVisible(), 0, 1); }
+function chFracToX(f, W) { return (f - C.off) / chVisible() * W; }
+function drawChop() {
+  const W = chCanvas.width = chCanvas.clientWidth * devicePixelRatio;
+  const H = chCanvas.height = chCanvas.clientHeight * devicePixelRatio;
+  chCtx2.clearRect(0, 0, W, H);
+  if (!C.buf) {
+    chCtx2.fillStyle = '#3a4258'; chCtx2.font = 12 * devicePixelRatio + 'px sans-serif'; chCtx2.textAlign = 'center';
+    chCtx2.fillText('tap ● REC and go for a walk — or IMPORT a recording', W / 2, H / 2);
+    $('#chTime').textContent = '';
+    return;
+  }
+  const d = C.buf.getChannelData(0), vis = chVisible();
+  const s0 = Math.floor(C.off * d.length), sN = Math.floor((C.off + vis) * d.length);
+  const perCol = Math.max(1, Math.floor((sN - s0) / W));
+  chCtx2.strokeStyle = '#5b8bd9'; chCtx2.lineWidth = 1; chCtx2.beginPath();
+  for (let x = 0; x < W; x++) {
+    const base = s0 + x * perCol; let mn = 1, mx = -1;
+    for (let i = 0; i < perCol; i += Math.max(1, perCol >> 4)) { const v = d[base + i] || 0; if (v < mn) mn = v; if (v > mx) mx = v; }
+    chCtx2.moveTo(x, H / 2 + mn * H * .46); chCtx2.lineTo(x, H / 2 + mx * H * .46 + 1);
+  }
+  chCtx2.stroke();
+  for (const m of sortedMarkers()) {
+    const x = chFracToX(m, W);
+    if (x < 0 || x > W) continue;
+    chCtx2.fillStyle = '#3ddc97';
+    chCtx2.fillRect(x - devicePixelRatio, 0, 2 * devicePixelRatio, H);
+    chCtx2.beginPath(); chCtx2.arc(x, H - 10 * devicePixelRatio, 7 * devicePixelRatio, 0, 7); chCtx2.fill();
+  }
+  if (C.lastTap >= 0) {
+    const x = chFracToX(C.lastTap, W);
+    chCtx2.strokeStyle = '#ffb02e'; chCtx2.setLineDash([4 * devicePixelRatio, 4 * devicePixelRatio]);
+    chCtx2.beginPath(); chCtx2.moveTo(x, 0); chCtx2.lineTo(x, H); chCtx2.stroke(); chCtx2.setLineDash([]);
+  }
+  if (C.playhead >= 0) {
+    const x = chFracToX(C.playhead, W);
+    chCtx2.fillStyle = '#e8ecf5'; chCtx2.fillRect(x, 0, 1.5 * devicePixelRatio, H);
+  }
+  $('#chTime').textContent = fmtTime(C.buf.duration) + ' · ' + (C.markers.length + 1) + ' slices';
+}
+let chDrag = null, chHoldTimer = 0;
+const chopBox = $('#chopWaveBox');
+chopBox.addEventListener('pointerdown', ev => {
+  if (!C.buf) return;
+  chopBox.setPointerCapture(ev.pointerId);
+  const rect = chCanvas.getBoundingClientRect();
+  const frac = chXToFrac(ev.clientX, rect);
+  const thresh = 12 / rect.width * chVisible();
+  let mi = -1, best = thresh;
+  C.markers.forEach((m, i) => { const dd = Math.abs(m - frac); if (dd < best) { best = dd; mi = i; } });
+  if (mi >= 0) {
+    chDrag = { type: 'marker', i: mi, moved: false };
+    chHoldTimer = setTimeout(() => {
+      C.markers.splice(mi, 1); chDrag = null; drawChop(); dirty(); toast('Marker removed');
+    }, 600);
+  } else {
+    chDrag = { type: 'pan', x0: ev.clientX, off0: C.off, moved: false, t0: performance.now(), frac };
+  }
+});
+chopBox.addEventListener('pointermove', ev => {
+  if (!chDrag || !ev.buttons) return;
+  const rect = chCanvas.getBoundingClientRect();
+  if (chDrag.type === 'marker') {
+    if (!chDrag.moved && Math.abs(ev.movementX) + Math.abs(ev.movementY) > 2) { chDrag.moved = true; clearTimeout(chHoldTimer); }
+    if (chDrag.moved) { C.markers[chDrag.i] = clamp(chXToFrac(ev.clientX, rect), .001, .999); drawChop(); }
+  } else {
+    const dx = ev.clientX - chDrag.x0;
+    if (Math.abs(dx) > 6) chDrag.moved = true;
+    C.off = clamp(chDrag.off0 - dx / rect.width * chVisible(), 0, 1 - chVisible());
+    drawChop();
+  }
+});
+chopBox.addEventListener('pointerup', ev => {
+  clearTimeout(chHoldTimer);
+  if (!chDrag) return;
+  if (chDrag.type === 'pan' && !chDrag.moved && performance.now() - chDrag.t0 < 400) auditionAt(chDrag.frac);
+  if (chDrag.type === 'marker') dirty();
+  chDrag = null;
+  drawChop();
+});
+$('#chZoom').oninput = e => {
+  C.z = Math.pow(50, e.target.value / 100);
+  C.off = clamp(C.off, 0, 1 - chVisible());
+  $('#chZoomOut').textContent = C.z.toFixed(1) + '×';
+  drawChop();
+};
+$('#chSens').oninput = e => { $('#chSensOut').textContent = e.target.value; };
 
 /* ------------------------------------------------ WAV + export */
 function encodeWav(chL, chR, sr) {
@@ -382,8 +646,8 @@ function idb() {
 }
 function serialize() {
   return {
-    v: 1, bpm: S.bpm, swing: S.swing, chain: S.chain.slice(), patLenDefault: S.patLen,
-    scale: S.scale, name: S.projName,
+    v: 2, bpm: S.bpm, swing: S.swing, chain: S.chain.slice(), patLenDefault: S.patLen,
+    scale: S.scale, name: S.projName, chopMarkers: C.markers.slice(),
     patterns: S.patterns.map(p => ({ len: p.len, steps: Object.fromEntries(Object.entries(p.steps).map(([k, v]) => [k, Array.from(v)])) })),
     pads: S.pads.map(p => !p.buf ? null : {
       name: p.name, gain: p.gain, pan: p.pan, semis: p.semis, mode: p.mode, choke: p.choke,
@@ -410,6 +674,7 @@ async function loadProject(key) {
   await ensureAudio();
   S.bpm = data.bpm; S.swing = data.swing; S.chain = data.chain || []; S.scale = data.scale || 'pmin';
   S.projName = data.name || key;
+  C.markers = data.chopMarkers || [];
   S.patterns = data.patterns.map(p => ({ len: p.len, steps: Object.fromEntries(Object.entries(p.steps).map(([k, v]) => [k, Uint8Array.from(v)])) }));
   while (S.patterns.length < NUM_PATTERNS) S.patterns.push({ len: 16, steps: {} });
   S.pads = data.pads.map(p => {
@@ -484,6 +749,7 @@ $$('.tab').forEach(t => t.onclick = () => {
   $('#page-' + t.dataset.page).classList.add('on');
   if (t.dataset.page === 'edit') drawEdit();
   if (t.dataset.page === 'seq') { drawSeqTop(); drawRowChips(); drawSteps(); }
+  if (t.dataset.page === 'chop') drawChop();
 });
 function gotoTab(name) { $$('.tab').find(t => t.dataset.page === name).click(); }
 
@@ -844,13 +1110,14 @@ window.addEventListener('resize', drawWave);
 let booted = false;
 async function boot() {
   if (booted) return; booted = true;
-  try { await ensureAudio(); await loadProject('__auto'); } catch (e) {}
+  try { await ensureAudio(); await loadProject('__auto'); await loadChopSource(); } catch (e) {}
 }
 document.addEventListener('pointerdown', boot, { once: true, capture: true });
 drawAll();
 
 /* debug/console access (harmless in production, handy on-device) */
 window.__g = {
-  get S() { return S; }, get ctx() { return ctx; },
+  get S() { return S; }, get ctx() { return ctx; }, get C() { return C; },
   ensureAudio, triggerPad, drawPads, drawEdit, drawAll, renderPatterns, saveProject, loadProject, dirty,
+  drawChop, autoSlice, auditionAt, saveChopSource, loadChopSource,
 };
