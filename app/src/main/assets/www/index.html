@@ -4,6 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="theme-color" content="#0b0d12">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Gibbon">
+<link rel="apple-touch-icon" href="icon-180.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
 <title>Gibbon</title>
 <style>
   :root{
@@ -11,9 +18,11 @@
     --txt:#e8ecf5; --dim:#7d879c; --acc:#ffb02e; --acc2:#3ddc97; --rec:#ff4d5e;
     --pad:#1c2130; --pad-lit:#ffb02e; --step:#20263a; --step-on:#3ddc97;
   }
-  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent; user-select:none; -webkit-user-select:none; touch-action:manipulation;}
-  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--txt);
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent; user-select:none; -webkit-user-select:none; -webkit-touch-callout:none; touch-action:manipulation;}
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--txt);overscroll-behavior:none;
     font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;}
+  /* performance surfaces must never hand the gesture to the browser (iOS pan/pinch → pointercancel) */
+  #padGrid,.pad,#fxGrid,.fxBtn,#xyPad,#waveBox,#chopWaveBox{touch-action:none;}
   #app{display:flex;flex-direction:column;height:100%;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);}
 
   /* ---------- top bar ---------- */
@@ -128,6 +137,9 @@
   #meter{position:absolute;top:0;left:0;height:2px;background:var(--rec);width:0;z-index:35;transition:width .06s linear;}
   #resampleBar{display:none;align-items:center;gap:10px;padding:8px 12px;background:#2a1216;border-bottom:1px solid #4b1e26;font-size:12px;color:#ffb3bb;}
   #resampleBar.on{display:flex;}
+  #saveBar{display:none;align-items:center;gap:10px;padding:8px 12px;background:#102a1e;border-bottom:1px solid #1e4b36;font-size:12px;color:#8ef0c4;}
+  #saveBar.on{display:flex;}
+  #saveBar button{margin-left:auto;background:var(--acc2);color:#0b0d12;border:none;border-radius:7px;padding:7px 14px;font-size:12px;font-weight:700;}
   #resampleBar button{margin-left:auto;background:var(--rec);color:#fff;border:none;border-radius:7px;padding:7px 12px;font-size:12px;}
   input[type=file]{display:none;}
 </style>
@@ -136,7 +148,7 @@
 <div id="app">
   <div id="meter"></div>
   <div id="topbar">
-    <div id="logo">GIBBON<span>&nbsp;sampler</span></div>
+    <div id="logo"><img src="icon-192.png" alt="" style="height:20px;width:20px;border-radius:5px;vertical-align:-4px;margin-right:6px">GIBBON<span>&nbsp;sampler</span></div>
     <div id="bpmBox">
       <button class="tb-btn" id="bpmDown">−</button>
       <div id="bpmVal">120<small> bpm</small></div>
@@ -149,6 +161,7 @@
     <button class="tb-btn" id="btnMenu">☰</button>
   </div>
   <div id="resampleBar"><span>RESAMPLING — playing output is being captured…</span><button id="btnResampleStop">STOP</button></div>
+  <div id="saveBar"><span id="saveBarLabel"></span><button id="btnSaveWav">SAVE</button></div>
   <div id="tabs">
     <div class="tab on" data-page="pads">PADS</div>
     <div class="tab" data-page="chop">CHOP</div>

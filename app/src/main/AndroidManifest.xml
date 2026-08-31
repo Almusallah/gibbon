@@ -5,6 +5,7 @@
     <uses-feature android:name="android.hardware.microphone" android:required="false"/>
     <application
         android:label="Gibbon"
+        android:icon="@mipmap/ic_launcher"
         android:hardwareAccelerated="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
         <activity android:name=".MainActivity" android:exported="true"

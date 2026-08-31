@@ -10,7 +10,7 @@ const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const NUM_BANKS = 4, PADS_PER_BANK = 16, NUM_PADS = NUM_BANKS * PADS_PER_BANK;
 const NUM_PATTERNS = 6;
 const SCALES = { chrom: [0,1,2,3,4,5,6,7,8,9,10,11], major: [0,2,4,5,7,9,11], minor: [0,2,3,5,7,8,10], pmin: [0,3,5,7,10], pmaj: [0,2,4,7,9] };
-const VERSION = 'v2';
+const VERSION = 'v3';
 
 /* ------------------------------------------------ state */
 const S = {
@@ -67,8 +67,13 @@ class Crush extends AudioWorkletProcessor {
 registerProcessor('crush', Crush);`;
 
 async function ensureAudio() {
-  if (ctx) { if (ctx.state !== 'running') await ctx.resume(); return; }
+  if (ctx) { if (ctx.state !== 'running') await ctx.resume().catch(() => {}); return; }
   ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+  // iOS: contexts can be born suspended, and calls/route changes suspend them later
+  if (ctx.state !== 'running') await ctx.resume().catch(() => {});
+  ctx.onstatechange = () => {
+    if (ctx.state === 'suspended' && document.visibilityState === 'visible') ctx.resume().catch(() => {});
+  };
   const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' }));
   await ctx.audioWorklet.addModule(url);
 
@@ -210,6 +215,7 @@ async function play(song = false) {
   curStep = 0; nextStepTime = ctx.currentTime + .06;
   schedTimer = setInterval(schedule, TICK);
   $('#btnPlay').classList.add('on'); $('#btnPlay').textContent = '■';
+  keepAwake(true);
 }
 function stop() {
   S.playing = false;
@@ -218,6 +224,7 @@ function stop() {
   if (master.gate) master.gate.gain.cancelScheduledValues(0), master.gate.gain.value = 1;
   $('#btnPlay').classList.remove('on'); $('#btnPlay').textContent = '▶';
   $$('.step.cur').forEach(el => el.classList.remove('cur'));
+  if (recTarget === -1) keepAwake(false);
 }
 
 function liveRecordNote(idx) {
@@ -231,13 +238,24 @@ function liveRecordNote(idx) {
 }
 
 /* ------------------------------------------------ mic recording + resample */
+let micSrc = null;
 async function ensureMic() {
   if (micStream) return;
   micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
-  const src = ctx.createMediaStreamSource(micStream);
+  micSrc = ctx.createMediaStreamSource(micStream);
   recNode = new AudioWorkletNode(ctx, 'cap', { numberOfInputs: 1 });
-  src.connect(recNode);
+  micSrc.connect(recNode);
   recNode.port.onmessage = e => onCapChunk(e.data, 'mic');
+}
+/* release the mic between recordings — while it is held, iOS runs a degraded
+ * play-and-record session (ducked, receiver-quality output) and a backgrounded
+ * tab can kill the track for good. ensureMic() reacquires on the next record. */
+function releaseMic() {
+  if (!micStream) return;
+  try { micStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  try { if (micSrc) micSrc.disconnect(); } catch (e) {}
+  try { if (recNode) recNode.disconnect(); } catch (e) {}
+  micStream = null; micSrc = null; recNode = null;
 }
 
 function onCapChunk(d, from) {
@@ -255,6 +273,7 @@ async function startMicRecording(padIdx) {
   try { await ensureMic(); } catch (e) { toast('Microphone unavailable: ' + e.message); S.recArm = false; drawTopbar(); return; }
   recKind = 'mic'; recChunks = []; recLen = 0; recTarget = padIdx;
   recNode.port.postMessage('start');
+  keepAwake(true);
   S.recordingPad = padIdx; drawPads(); drawTopbar();
   toast('Recording pad ' + padLabel(padIdx) + ' — tap again to stop');
 }
@@ -272,9 +291,10 @@ function startResample() {
 function stopRecording() {
   if (recTarget === -1) return;
   const padIdx = recTarget; recTarget = -1;
-  if (recKind === 'mic') recNode.port.postMessage('stop');
+  if (recKind === 'mic') { recNode.port.postMessage('stop'); releaseMic(); }
   else { master.cap.port.postMessage('stop'); $('#resampleBar').classList.remove('on'); }
   $('#meter').style.width = '0';
+  if (!S.playing) keepAwake(false);
   if (padIdx === CHOP_TARGET) { finalizeChopRecording(); return; }
   if (recLen < 256) { toast('Too short'); S.recordingPad = -1; drawPads(); return; }
   const buf = ctx.createBuffer(2, recLen, ctx.sampleRate);
@@ -328,6 +348,7 @@ async function startChopRecording() {
   try { await ensureMic(); } catch (e) { toast('Microphone unavailable: ' + e.message); return; }
   recKind = 'mic'; recChunks = []; recLen = 0; recTarget = CHOP_TARGET;
   recNode.port.postMessage('start');
+  keepAwake(true);
   const b = $('#chRec'); b.classList.add('rec');
   chRecTimer = setInterval(() => { b.textContent = '● ' + fmtTime(recLen / ctx.sampleRate); }, 250);
   toast('Recording — walk around, tap ● to stop (max 6:00)');
@@ -559,6 +580,9 @@ chopBox.addEventListener('pointerup', ev => {
   chDrag = null;
   drawChop();
 });
+chopBox.addEventListener('pointercancel', () => {
+  clearTimeout(chHoldTimer); chDrag = null; drawChop();
+});
 $('#chZoom').oninput = e => {
   C.z = Math.pow(50, e.target.value / 100);
   C.off = clamp(C.off, 0, 1 - chVisible());
@@ -591,13 +615,89 @@ function saveWav(arrayBuf, name) {
     for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
     GibbonBridge.saveFile(name, btoa(bin));
     toast('Saved to Downloads: ' + name);
+  } else if (IS_IOS) {
+    /* navigator.share needs fresh user activation, which is gone after async
+     * renders — and <a download> is inert in an installed iOS web app. So on
+     * iOS every export parks here and the SAVE bar's own tap does the share. */
+    pendingSave = { blob: new Blob([arrayBuf], { type: 'audio/wav' }), name };
+    $('#saveBarLabel').textContent = name + ' ready';
+    $('#saveBar').classList.add('on');
   } else {
+    const blob = new Blob([arrayBuf], { type: 'audio/wav' });
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([arrayBuf], { type: 'audio/wav' }));
-    a.download = name; a.click();
+    const u = URL.createObjectURL(blob);
+    a.href = u; a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(u), 60000);
     toast('Exported ' + name);
   }
 }
+const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+let pendingSave = null;
+$('#btnSaveWav').addEventListener('click', () => {
+  if (!pendingSave) { $('#saveBar').classList.remove('on'); return; }
+  const { blob, name } = pendingSave;
+  const file = new File([blob], name, { type: 'audio/wav' });
+  const done = () => { pendingSave = null; $('#saveBar').classList.remove('on'); };
+  // share() is called synchronously inside this tap — activation is valid here
+  const p = (navigator.canShare && navigator.canShare({ files: [file] }))
+    ? navigator.share({ files: [file] })
+    : Promise.reject({ name: 'NoShare' });
+  p.then(done).catch(e => {
+    if (e && e.name === 'AbortError') return; // user closed the sheet — keep the bar for retry
+    const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+    if (!standalone) {
+      const a = document.createElement('a');
+      const u = URL.createObjectURL(blob);
+      a.href = u; a.download = name; a.click();
+      setTimeout(() => URL.revokeObjectURL(u), 60000);
+      done(); toast('Downloaded ' + name);
+    } else toast('Share failed — tap SAVE to retry');
+  });
+});
+
+/* iOS audio session: a WebAudio-only page runs "ambient" and the ring/silent
+ * switch mutes it. Prefer the Audio Session API; where absent, a looping
+ * silent <audio> element promotes the session to playback. */
+try { if ('audioSession' in navigator) navigator.audioSession.type = 'playback'; } catch (e) {}
+let iosUnlockEl = null;
+function iosAudioUnlock() {
+  if (!IS_IOS || ('audioSession' in navigator)) return;
+  if (!iosUnlockEl) {
+    iosUnlockEl = document.createElement('audio');
+    iosUnlockEl.loop = true;
+    iosUnlockEl.setAttribute('playsinline', '');
+    iosUnlockEl.src = URL.createObjectURL(
+      new Blob([encodeWav(new Float32Array(400), new Float32Array(400), 8000)], { type: 'audio/wav' }));
+  }
+  if (iosUnlockEl.paused) iosUnlockEl.play().catch(() => {});
+}
+
+/* recover from interruptions (calls, route changes, backgrounding) on real
+ * activation-granting gestures — iOS does not count touch-derived pointerdown */
+function tryResume() {
+  if (ctx && ctx.state !== 'running') ctx.resume().catch(() => {});
+  iosAudioUnlock();
+}
+document.addEventListener('pointerup', tryResume, true);
+document.addEventListener('click', tryResume, true);
+
+/* keep the screen awake while playing or recording (Android shell does this natively) */
+let wakeLock = null;
+async function keepAwake(on) {
+  try {
+    if (on && 'wakeLock' in navigator && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } else if (!on && wakeLock) { await wakeLock.release(); wakeLock = null; }
+  } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (S.playing || recTarget !== -1) keepAwake(true);
+  if (ctx && ctx.state !== 'running') ctx.resume().catch(() => {});
+  if (iosUnlockEl && iosUnlockEl.paused) iosUnlockEl.play().catch(() => {});
+});
 
 async function renderPatterns(patIdxList, name) {
   await ensureAudio();
@@ -721,6 +821,7 @@ for (const [id, d] of [['#bpmUp', 1], ['#bpmDown', -1]]) {
   $(id).addEventListener('pointerdown', () => { holdIv = setInterval(() => { S.bpm = clamp(S.bpm + d, 40, 240); drawTopbar(); }, 90); });
   $(id).addEventListener('pointerup', () => { clearInterval(holdIv); dirty(); });
   $(id).addEventListener('pointerleave', () => clearInterval(holdIv));
+  $(id).addEventListener('pointercancel', () => clearInterval(holdIv));
 }
 let taps = [];
 $('#btnTap').onclick = () => {
@@ -790,6 +891,7 @@ for (let i = 0; i < PADS_PER_BANK; i++) {
   };
   el.addEventListener('pointerup', up);
   el.addEventListener('pointerleave', up);
+  el.addEventListener('pointercancel', up);
 }
 function padLabel(idx) { return 'ABCD'[Math.floor(idx / PADS_PER_BANK)] + (idx % PADS_PER_BANK + 1); }
 function drawPads() {
@@ -888,6 +990,7 @@ for (const key in FX) {
     S.fx = key; applyFx(); drawFx();
   });
   b.addEventListener('pointerup', () => { if (!S.fxLatch) clearFx(); });
+  b.addEventListener('pointercancel', () => { if (!S.fxLatch) clearFx(); });
   fxGrid.appendChild(b);
 }
 function drawFx() {
@@ -995,6 +1098,7 @@ $('#waveBox').addEventListener('pointermove', ev => {
   moveHandle((ev.clientX - r.left) / r.width);
 });
 $('#waveBox').addEventListener('pointerup', () => { dragHandle = null; dirty(); });
+$('#waveBox').addEventListener('pointercancel', () => { dragHandle = null; });
 function moveHandle(x) {
   const p = S.pads[S.selPad]; x = clamp(x, 0, 1);
   if (dragHandle === 'start') p.start = Math.min(x, p.end - .005);
@@ -1110,10 +1214,17 @@ window.addEventListener('resize', drawWave);
 let booted = false;
 async function boot() {
   if (booted) return; booted = true;
+  try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
   try { await ensureAudio(); await loadProject('__auto'); await loadChopSource(); } catch (e) {}
 }
 document.addEventListener('pointerdown', boot, { once: true, capture: true });
+document.addEventListener('pointerup', boot, { once: true, capture: true });
 drawAll();
+
+/* PWA: offline service worker — only on the hosted site, never inside the Android shell */
+if ('serviceWorker' in navigator && location.hostname.endsWith('github.io')) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
 
 /* debug/console access (harmless in production, handy on-device) */
 window.__g = {

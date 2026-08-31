@@ -1,8 +1,12 @@
+<img src="logo-rounded.png" width="96" align="right">
+
 # Gibbon 🦧♪
 
-A personal pocket sampler for Android — record anything, chop it onto pads, sequence a beat, perform mix FX, resample, export WAV. Original work inspired by the workflow of pocket samplers; no third-party code or assets. Fully offline (the app has **no INTERNET permission**), autosaves, free.
+A personal pocket sampler — record anything (especially the city), chop it onto pads, sequence a beat, perform mix FX, resample, export WAV. Original work inspired by the workflow of pocket samplers; no third-party code or assets. Offline, autosaves, free.
 
-**Install:** grab `gibbon.apk` from [Releases → latest](../../releases/latest) on the phone, install (allow "unknown sources" once). Updates install over the top — same signing key, projects survive.
+**Android:** grab `gibbon.apk` from [Releases → latest](../../releases/latest) on the phone, install (allow "unknown sources" once). Updates install over the top — same signing key, projects survive. Fully offline (**no INTERNET permission**).
+
+**iOS / iPad:** open **https://almusallah.github.io/gibbon/** in Safari → Share → **Add to Home Screen**. Runs full-screen and offline (service worker), mic works, projects autosave on-device, WAV export goes through the share sheet. Same engine, same features.
 
 ## What it does
 
