@@ -1,0 +1,31 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'com.almusallah.gibbon'
+    compileSdk 34
+    defaultConfig {
+        applicationId 'com.almusallah.gibbon'
+        minSdk 29
+        targetSdk 34
+        versionCode ((project.findProperty('verCode') ?: '1') as Integer)
+        versionName '1.' + (project.findProperty('verCode') ?: '1')
+    }
+    signingConfigs {
+        release {
+            storeFile rootProject.file('keystore.jks')
+            storePassword 'gibbonsings'
+            keyAlias 'gibbon'
+            keyPassword 'gibbonsings'
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.webkit:webkit:1.11.0'
+}

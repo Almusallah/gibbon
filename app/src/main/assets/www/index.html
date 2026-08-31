@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d12">
+<title>Gibbon</title>
+<style>
+  :root{
+    --bg:#0b0d12; --panel:#12151d; --panel2:#181c27; --line:#232837;
+    --txt:#e8ecf5; --dim:#7d879c; --acc:#ffb02e; --acc2:#3ddc97; --rec:#ff4d5e;
+    --pad:#1c2130; --pad-lit:#ffb02e; --step:#20263a; --step-on:#3ddc97;
+  }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent; user-select:none; -webkit-user-select:none; touch-action:manipulation;}
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--txt);
+    font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;}
+  #app{display:flex;flex-direction:column;height:100%;padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);}
+
+  /* ---------- top bar ---------- */
+  #topbar{display:flex;align-items:center;gap:6px;padding:8px 10px;background:var(--panel);border-bottom:1px solid var(--line);}
+  #logo{font-weight:800;letter-spacing:.12em;font-size:14px;color:var(--acc);}
+  #logo span{color:var(--dim);font-weight:400;}
+  .tb-btn{background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:8px;
+    padding:8px 10px;font-size:15px;line-height:1;min-width:40px;text-align:center;}
+  .tb-btn:active{background:#242a3a;}
+  .tb-btn.on{color:#0b0d12;background:var(--acc2);border-color:var(--acc2);}
+  #btnPlay.on{background:var(--acc2);border-color:var(--acc2);}
+  #btnRec.on{background:var(--rec);border-color:var(--rec);color:#fff;animation:blink 1s steps(2) infinite;}
+  @keyframes blink{50%{opacity:.55}}
+  #bpmBox{display:flex;align-items:center;gap:2px;margin-left:auto;}
+  #bpmVal{font-variant-numeric:tabular-nums;font-size:15px;font-weight:700;min-width:44px;text-align:center;}
+  #bpmVal small{color:var(--dim);font-weight:400;}
+
+  /* ---------- tabs ---------- */
+  #tabs{display:flex;background:var(--panel);border-bottom:1px solid var(--line);}
+  .tab{flex:1;text-align:center;padding:10px 0;font-size:13px;font-weight:700;letter-spacing:.08em;color:var(--dim);border-bottom:2px solid transparent;}
+  .tab.on{color:var(--txt);border-bottom-color:var(--acc);}
+
+  #main{flex:1;overflow:hidden;position:relative;}
+  .page{position:absolute;inset:0;display:none;flex-direction:column;overflow:hidden;}
+  .page.on{display:flex;}
+
+  /* ---------- pads page ---------- */
+  #bankRow{display:flex;gap:6px;padding:8px 10px 0;}
+  .bank{flex:1;text-align:center;padding:7px 0;border-radius:8px;background:var(--panel2);border:1px solid var(--line);font-size:12px;font-weight:700;color:var(--dim);}
+  .bank.on{color:#0b0d12;background:var(--acc);border-color:var(--acc);}
+  #padGrid{flex:1;display:grid;grid-template-columns:repeat(4,1fr);grid-template-rows:repeat(4,1fr);gap:8px;padding:10px;}
+  .pad{border-radius:12px;background:var(--pad);border:1px solid var(--line);position:relative;overflow:hidden;
+    display:flex;align-items:flex-end;justify-content:flex-start;padding:6px 8px;font-size:10px;color:var(--dim);}
+  .pad.filled{border-color:#39415c;background:linear-gradient(180deg,#232a3f,#1a1f2f);color:var(--txt);}
+  .pad.sel{outline:2px solid var(--acc);outline-offset:-2px;}
+  .pad.lit{background:var(--pad-lit);color:#0b0d12;border-color:var(--pad-lit);}
+  .pad.armed{outline:2px dashed var(--rec);outline-offset:-2px;}
+  .pad .num{position:absolute;top:5px;right:8px;font-size:9px;color:inherit;opacity:.5;}
+  #padHint{padding:0 12px 8px;font-size:11px;color:var(--dim);text-align:center;}
+
+  /* ---------- sequencer page ---------- */
+  #seqTop{display:flex;gap:6px;padding:8px 10px 0;align-items:center;flex-wrap:wrap;}
+  .patBtn{padding:7px 12px;border-radius:8px;background:var(--panel2);border:1px solid var(--line);font-size:12px;font-weight:700;color:var(--dim);}
+  .patBtn.on{color:#0b0d12;background:var(--acc);border-color:var(--acc);}
+  .seq-ctl{padding:7px 10px;border-radius:8px;background:var(--panel2);border:1px solid var(--line);font-size:12px;color:var(--txt);}
+  .seq-ctl.on{background:var(--acc2);border-color:var(--acc2);color:#0b0d12;font-weight:700;}
+  #rowChips{display:flex;gap:6px;padding:8px 10px 0;flex-wrap:wrap;max-height:74px;overflow-y:auto;}
+  .chip{padding:6px 10px;border-radius:14px;background:var(--panel2);border:1px solid var(--line);font-size:11px;color:var(--txt);}
+  .chip.on{background:var(--acc);border-color:var(--acc);color:#0b0d12;font-weight:700;}
+  #stepWrap{flex:1;padding:10px;display:flex;flex-direction:column;gap:8px;overflow-y:auto;}
+  .stepRow{display:grid;grid-template-columns:repeat(8,1fr);gap:6px;}
+  .step{aspect-ratio:1/1.15;border-radius:7px;background:var(--step);border:1px solid var(--line);position:relative;}
+  .step.beat{background:#273049;}
+  .step.on{background:var(--step-on);border-color:var(--step-on);}
+  .step.cur::after{content:'';position:absolute;inset:auto 3px 3px 3px;height:3px;border-radius:2px;background:var(--acc);}
+  #seqHint{padding:0 12px 8px;font-size:11px;color:var(--dim);text-align:center;}
+  #swingBox{display:flex;align-items:center;gap:8px;padding:0 12px 6px;font-size:12px;color:var(--dim);}
+  #swingBox input{flex:1;}
+
+  /* ---------- fx page ---------- */
+  #fxGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:10px;}
+  .fxBtn{padding:16px 0;border-radius:10px;background:var(--panel2);border:1px solid var(--line);text-align:center;font-size:13px;font-weight:700;color:var(--txt);}
+  .fxBtn.on{background:var(--acc);border-color:var(--acc);color:#0b0d12;}
+  #xyPad{flex:1;margin:0 10px 10px;border-radius:12px;background:radial-gradient(circle at 50% 50%,#1a2030,#12151d);border:1px solid var(--line);position:relative;min-height:180px;}
+  #xyDot{position:absolute;width:26px;height:26px;border-radius:50%;background:var(--acc);transform:translate(-50%,-50%);left:50%;top:50%;box-shadow:0 0 18px var(--acc);pointer-events:none;}
+  #fxRow2{display:flex;gap:8px;padding:0 10px 10px;}
+  #fxRow2 .seq-ctl{flex:1;text-align:center;}
+  #xyLabel{position:absolute;left:10px;top:8px;font-size:11px;color:var(--dim);pointer-events:none;}
+
+  /* ---------- edit page ---------- */
+  #editWrap{flex:1;overflow-y:auto;padding:10px;display:flex;flex-direction:column;gap:10px;}
+  #waveBox{position:relative;height:150px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;overflow:hidden;touch-action:none;}
+  #waveCanvas{width:100%;height:100%;display:block;}
+  #editName{font-size:13px;color:var(--txt);font-weight:700;display:flex;justify-content:space-between;align-items:center;}
+  #editName small{color:var(--dim);font-weight:400;}
+  .ctlRow{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--dim);}
+  .ctlRow label{width:52px;flex-shrink:0;}
+  .ctlRow input[type=range]{flex:1;accent-color:var(--acc);}
+  .ctlRow output{width:52px;text-align:right;font-variant-numeric:tabular-nums;color:var(--txt);flex-shrink:0;}
+  #editBtns{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}
+  .ebtn{padding:11px 0;border-radius:9px;background:var(--panel2);border:1px solid var(--line);text-align:center;font-size:12px;color:var(--txt);}
+  .ebtn.on{background:var(--acc2);border-color:var(--acc2);color:#0b0d12;font-weight:700;}
+  .ebtn.danger{color:var(--rec);}
+
+  /* ---------- menu drawer ---------- */
+  #menu{position:absolute;inset:0;background:rgba(5,7,10,.72);display:none;z-index:30;}
+  #menu.on{display:block;}
+  #menuPanel{position:absolute;top:0;right:0;bottom:0;width:min(320px,86%);background:var(--panel);border-left:1px solid var(--line);
+    padding:14px;display:flex;flex-direction:column;gap:10px;overflow-y:auto;}
+  #menuPanel h3{margin:4px 0 2px;font-size:12px;letter-spacing:.1em;color:var(--dim);font-weight:700;}
+  .mbtn{padding:12px;border-radius:9px;background:var(--panel2);border:1px solid var(--line);font-size:13px;color:var(--txt);text-align:left;}
+  .mbtn:active{background:#242a3a;}
+  #projName{padding:10px;border-radius:9px;background:var(--panel2);border:1px solid var(--line);color:var(--txt);font-size:14px;width:100%;user-select:text;-webkit-user-select:text;}
+  #projList{display:flex;flex-direction:column;gap:6px;}
+  .projItem{display:flex;gap:6px;}
+  .projItem .mbtn{flex:1;}
+  .projItem .del{width:44px;text-align:center;color:var(--rec);}
+
+  /* ---------- toast + meter ---------- */
+  #toast{position:absolute;left:50%;bottom:24px;transform:translateX(-50%);background:#20263a;border:1px solid var(--line);
+    color:var(--txt);padding:10px 16px;border-radius:20px;font-size:13px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:40;max-width:86%;text-align:center;}
+  #toast.on{opacity:1;}
+  #meter{position:absolute;top:0;left:0;height:2px;background:var(--rec);width:0;z-index:35;transition:width .06s linear;}
+  #resampleBar{display:none;align-items:center;gap:10px;padding:8px 12px;background:#2a1216;border-bottom:1px solid #4b1e26;font-size:12px;color:#ffb3bb;}
+  #resampleBar.on{display:flex;}
+  #resampleBar button{margin-left:auto;background:var(--rec);color:#fff;border:none;border-radius:7px;padding:7px 12px;font-size:12px;}
+  input[type=file]{display:none;}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="meter"></div>
+  <div id="topbar">
+    <div id="logo">GIBBON<span>&nbsp;sampler</span></div>
+    <div id="bpmBox">
+      <button class="tb-btn" id="bpmDown">−</button>
+      <div id="bpmVal">120<small> bpm</small></div>
+      <button class="tb-btn" id="bpmUp">+</button>
+      <button class="tb-btn" id="btnTap">TAP</button>
+    </div>
+    <button class="tb-btn" id="btnMetro">🜁</button>
+    <button class="tb-btn" id="btnPlay">▶</button>
+    <button class="tb-btn" id="btnRec">●</button>
+    <button class="tb-btn" id="btnMenu">☰</button>
+  </div>
+  <div id="resampleBar"><span>RESAMPLING — playing output is being captured…</span><button id="btnResampleStop">STOP</button></div>
+  <div id="tabs">
+    <div class="tab on" data-page="pads">PADS</div>
+    <div class="tab" data-page="seq">SEQ</div>
+    <div class="tab" data-page="fx">FX</div>
+    <div class="tab" data-page="edit">EDIT</div>
+  </div>
+  <div id="main">
+    <div class="page on" id="page-pads">
+      <div id="bankRow"></div>
+      <div id="padGrid"></div>
+      <div id="padHint">tap ● then a pad to sample from the mic · long-press a pad to select it for EDIT</div>
+    </div>
+    <div class="page" id="page-seq">
+      <div id="seqTop"></div>
+      <div id="rowChips"></div>
+      <div id="stepWrap"></div>
+      <div id="swingBox"><span>swing</span><input type="range" id="swing" min="0" max="60" value="0"><output id="swingOut">0%</output></div>
+      <div id="seqHint">steps edit the selected pad · play + tap pads to live-record (quantized)</div>
+    </div>
+    <div class="page" id="page-fx">
+      <div id="fxGrid"></div>
+      <div id="xyPad"><span id="xyLabel">drag to perform</span><div id="xyDot"></div></div>
+      <div id="fxRow2">
+        <button class="seq-ctl" id="btnLatch">LATCH: OFF</button>
+        <button class="seq-ctl" id="btnFxClear">CLEAR FX</button>
+      </div>
+    </div>
+    <div class="page" id="page-edit">
+      <div id="editWrap">
+        <div id="editName"><span id="editTitle">no pad selected</span><small id="editMeta"></small></div>
+        <div id="waveBox"><canvas id="waveCanvas"></canvas></div>
+        <div class="ctlRow"><label>gain</label><input type="range" id="cGain" min="0" max="150" value="100"><output id="oGain">100%</output></div>
+        <div class="ctlRow"><label>pitch</label><input type="range" id="cPitch" min="-12" max="12" value="0" step="1"><output id="oPitch">0 st</output></div>
+        <div class="ctlRow"><label>pan</label><input type="range" id="cPan" min="-100" max="100" value="0"><output id="oPan">C</output></div>
+        <div id="editBtns">
+          <button class="ebtn" id="bMode">ONE-SHOT</button>
+          <button class="ebtn" id="bReverse">REVERSE</button>
+          <button class="ebtn" id="bNorm">NORMALIZE</button>
+          <button class="ebtn" id="bChoke">CHOKE: –</button>
+          <button class="ebtn" id="bCrop">CROP</button>
+          <button class="ebtn" id="bImport">IMPORT</button>
+          <button class="ebtn" id="bCopy">COPY</button>
+          <button class="ebtn" id="bPaste">PASTE</button>
+          <button class="ebtn danger" id="bClear">CLEAR</button>
+        </div>
+        <div class="ctlRow"><label>keys</label><button class="ebtn" id="bKeys" style="flex:1">KEYBOARD MODE: OFF</button></div>
+        <div class="ctlRow"><label>scale</label><select id="selScale" class="seq-ctl" style="flex:1">
+          <option value="chrom">chromatic</option><option value="major">major</option><option value="minor">minor</option>
+          <option value="pmin">pentatonic minor</option><option value="pmaj">pentatonic major</option>
+        </select></div>
+      </div>
+    </div>
+  </div>
+  <div id="menu">
+    <div id="menuPanel">
+      <h3>PROJECT</h3>
+      <input id="projName" value="untitled" spellcheck="false">
+      <button class="mbtn" id="mSave">💾 Save project</button>
+      <button class="mbtn" id="mNew">✚ New project</button>
+      <div id="projList"></div>
+      <h3>EXPORT</h3>
+      <button class="mbtn" id="mExportLoop">⬇ Export loop (current pattern) → WAV</button>
+      <button class="mbtn" id="mExportSong">⬇ Export song (chain) → WAV</button>
+      <button class="mbtn" id="mExportPad">⬇ Export selected pad → WAV</button>
+      <h3>RESAMPLE</h3>
+      <button class="mbtn" id="mResample">◉ Resample output → next empty pad</button>
+      <h3>SONG CHAIN</h3>
+      <div style="font-size:11px;color:var(--dim)">Tap patterns to build the chain, then export song.</div>
+      <div id="chainRow" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+      <div id="chainView" style="font-size:12px;color:var(--txt);min-height:18px"></div>
+      <button class="mbtn" id="mChainClear">Clear chain</button>
+      <h3>ABOUT</h3>
+      <div style="font-size:11px;color:var(--dim);line-height:1.5">Gibbon — a personal pocket sampler. Offline, autosaves, exports WAV to Downloads. <span id="verLabel"></span></div>
+      <button class="mbtn" id="mClose">Close</button>
+    </div>
+  </div>
+  <div id="toast"></div>
+  <input type="file" id="fileIn" accept="audio/*,video/*">
+</div>
+<script src="app.js"></script>
+</body>
+</html>

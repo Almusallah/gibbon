@@ -1,0 +1,856 @@
+/* Gibbon — personal pocket sampler.
+ * Original work: record → pads → sequence → mix FX → resample → WAV.
+ * Runs offline in an Android WebView (see GibbonBridge) or any modern browser. */
+'use strict';
+
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+
+const NUM_BANKS = 4, PADS_PER_BANK = 16, NUM_PADS = NUM_BANKS * PADS_PER_BANK;
+const NUM_PATTERNS = 6;
+const SCALES = { chrom: [0,1,2,3,4,5,6,7,8,9,10,11], major: [0,2,4,5,7,9,11], minor: [0,2,3,5,7,8,10], pmin: [0,3,5,7,10], pmaj: [0,2,4,7,9] };
+const VERSION = 'v1';
+
+/* ------------------------------------------------ state */
+const S = {
+  bpm: 120, swing: 0, playing: false, metro: false,
+  bank: 0, selPad: 0, pattern: 0, patLen: 16,
+  keys: false, scale: 'pmin',
+  recArm: false, recordingPad: -1, noteRec: false,
+  fx: null, fxLatch: false, fxXY: { x: .5, y: .5 },
+  chain: [],
+  patterns: [], // [{len, steps:{padIdx: Uint8Array}}]
+  pads: [],     // {buf(AudioBuffer)|null, name, gain, pan, semis, mode, choke, start, end}
+  clipboard: null,
+  projName: 'untitled',
+};
+for (let i = 0; i < NUM_PATTERNS; i++) S.patterns.push({ len: 16, steps: {} });
+for (let i = 0; i < NUM_PADS; i++) S.pads.push(newPad());
+function newPad() { return { buf: null, name: '', gain: 1, pan: 0, semis: 0, mode: 'oneshot', choke: 0, start: 0, end: 1 }; }
+
+/* ------------------------------------------------ audio graph */
+let ctx = null, master = {}, micStream = null, recNode = null;
+let recChunks = [], recLen = 0, recTarget = -1, recTimer = 0, recKind = 'mic';
+const activeSrc = new Map(); // padIdx -> [{src,g}]
+
+const WORKLET_SRC = `
+class Cap extends AudioWorkletProcessor {
+  constructor(){ super(); this.on=false; this.port.onmessage=e=>{ this.on = e.data==='start'; }; }
+  process(inputs){
+    if (this.on && inputs[0] && inputs[0][0]) {
+      const L = inputs[0][0], R = inputs[0][1] || inputs[0][0];
+      this.port.postMessage({ L: L.slice(0), R: R.slice(0) });
+    }
+    return true;
+  }
+}
+registerProcessor('cap', Cap);
+class Crush extends AudioWorkletProcessor {
+  constructor(){ super(); this.bits=16; this.down=1; this.wet=0; this.hold=[0,0]; this.n=0;
+    this.port.onmessage=e=>{ Object.assign(this, e.data); }; }
+  process(inputs, outputs){
+    const inp = inputs[0], out = outputs[0];
+    if (!inp || !inp.length) return true;
+    const step = Math.pow(2, this.bits - 1);
+    for (let c = 0; c < out.length; c++) {
+      const i = inp[c] || inp[0], o = out[c];
+      for (let s = 0; s < o.length; s++) {
+        if ((this.n + s) % this.down === 0) this.hold[c] = Math.round(i[s] * step) / step;
+        o[s] = i[s] * (1 - this.wet) + this.hold[c] * this.wet;
+      }
+    }
+    this.n += out[0].length;
+    return true;
+  }
+}
+registerProcessor('crush', Crush);`;
+
+async function ensureAudio() {
+  if (ctx) { if (ctx.state !== 'running') await ctx.resume(); return; }
+  ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+  const url = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' }));
+  await ctx.audioWorklet.addModule(url);
+
+  const m = master;
+  m.in = ctx.createGain();
+  m.hp = ctx.createBiquadFilter(); m.hp.type = 'highpass'; m.hp.frequency.value = 10; m.hp.Q.value = .7;
+  m.lp = ctx.createBiquadFilter(); m.lp.type = 'lowpass'; m.lp.frequency.value = 20000; m.lp.Q.value = .7;
+  m.crush = new AudioWorkletNode(ctx, 'crush', { outputChannelCount: [2] });
+  m.gate = ctx.createGain();
+  m.comp = ctx.createDynamicsCompressor();
+  m.comp.threshold.value = -12; m.comp.ratio.value = 4; m.comp.attack.value = .003; m.comp.release.value = .12;
+  m.out = ctx.createGain();
+  m.in.connect(m.hp); m.hp.connect(m.lp); m.lp.connect(m.crush); m.crush.connect(m.gate); m.gate.connect(m.comp); m.comp.connect(m.out); m.out.connect(ctx.destination);
+
+  // delay send (feedback loop with tone filter)
+  m.dSend = ctx.createGain(); m.dSend.gain.value = 0;
+  m.delay = ctx.createDelay(2); m.delay.delayTime.value = .3;
+  m.dFb = ctx.createGain(); m.dFb.gain.value = .35;
+  m.dTone = ctx.createBiquadFilter(); m.dTone.type = 'lowpass'; m.dTone.frequency.value = 4000;
+  m.in.connect(m.dSend); m.dSend.connect(m.delay); m.delay.connect(m.dTone); m.dTone.connect(m.dFb); m.dFb.connect(m.delay); m.dTone.connect(m.gate);
+
+  // reverb send
+  m.rSend = ctx.createGain(); m.rSend.gain.value = 0;
+  m.verb = ctx.createConvolver(); m.verb.buffer = makeIR(ctx, 2.2);
+  m.in.connect(m.rSend); m.rSend.connect(m.verb); m.verb.connect(m.gate);
+
+  // capture tap (for resample + bounce)
+  m.cap = new AudioWorkletNode(ctx, 'cap', { numberOfInputs: 1, channelCount: 2 });
+  m.comp.connect(m.cap);
+  m.cap.port.onmessage = e => onCapChunk(e.data);
+}
+
+function makeIR(c, seconds) {
+  const sr = c.sampleRate, len = Math.floor(sr * seconds);
+  const buf = c.createBuffer(2, len, sr);
+  for (let ch = 0; ch < 2; ch++) {
+    const d = buf.getChannelData(ch);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 2.6);
+  }
+  return buf;
+}
+
+/* ------------------------------------------------ pad playback */
+function padSemisFor(idx, gridPos) {
+  const p = S.pads[idx];
+  if (!S.keys || gridPos === undefined) return p.semis;
+  const sc = SCALES[S.scale], row = 3 - (gridPos >> 2), deg = row * 4 + (gridPos & 3);
+  return p.semis + sc[deg % sc.length] + 12 * Math.floor(deg / sc.length);
+}
+
+function triggerPad(idx, when = 0, gridPos = undefined, dest = null, oCtx = null) {
+  const c = oCtx || ctx, p = S.pads[idx];
+  if (!c || !p.buf) return null;
+  if (!oCtx && p.choke) {
+    for (let i = 0; i < NUM_PADS; i++) {
+      if (i !== idx && S.pads[i].choke === p.choke) stopPad(i, when || c.currentTime);
+    }
+    stopPad(idx, when || c.currentTime);
+  }
+  const src = c.createBufferSource();
+  src.buffer = p.buf;
+  src.playbackRate.value = Math.pow(2, padSemisFor(idx, gridPos) / 12);
+  if (p.mode === 'loop') { src.loop = true; src.loopStart = p.start * p.buf.duration; src.loopEnd = p.end * p.buf.duration; }
+  const g = c.createGain(); g.gain.value = p.gain;
+  const pan = c.createStereoPanner ? c.createStereoPanner() : null;
+  src.connect(g);
+  if (pan) { pan.pan.value = p.pan; g.connect(pan); pan.connect(dest || master.in); }
+  else g.connect(dest || master.in);
+  const t = when || c.currentTime;
+  const off = p.start * p.buf.duration, dur = (p.end - p.start) * p.buf.duration;
+  if (p.mode === 'loop') src.start(t, off);
+  else src.start(t, off, dur / src.playbackRate.value);
+  if (!oCtx) {
+    if (!activeSrc.has(idx)) activeSrc.set(idx, []);
+    const rec = { src, g };
+    activeSrc.get(idx).push(rec);
+    src.onended = () => { const a = activeSrc.get(idx); if (a) { const k = a.indexOf(rec); if (k >= 0) a.splice(k, 1); } };
+  }
+  return src;
+}
+
+function stopPad(idx, when) {
+  const a = activeSrc.get(idx);
+  if (!a) return;
+  const t = when || (ctx ? ctx.currentTime : 0);
+  for (const r of a) { try { r.g.gain.setTargetAtTime(0, t, .01); r.src.stop(t + .05); } catch (e) {} }
+  activeSrc.set(idx, []);
+}
+function stopAllPads() { for (let i = 0; i < NUM_PADS; i++) stopPad(i); }
+
+/* ------------------------------------------------ sequencer */
+let nextStepTime = 0, curStep = 0, schedTimer = 0;
+const LOOKAHEAD = 0.12, TICK = 25;
+
+function stepDur() { return 60 / S.bpm / 4; }
+
+function schedule() {
+  const pat = S.patterns[S.pattern];
+  while (nextStepTime < ctx.currentTime + LOOKAHEAD) {
+    let t = nextStepTime;
+    if (curStep % 2 === 1) t += stepDur() * (S.swing / 100) * .75;
+    for (const k in pat.steps) {
+      if (pat.steps[k][curStep]) triggerPad(+k, t);
+    }
+    if (S.metro && curStep % 4 === 0) click(t, curStep % 16 === 0);
+    if (S.fx === 'gate' && gateParams.depth > 0) {
+      const div = gateParams.div, g = master.gate.gain;
+      if (curStep % div === 0) {
+        g.setValueAtTime(1, t);
+        g.setTargetAtTime(1 - gateParams.depth, t + stepDur() * div * .5, .004);
+      }
+    }
+    uiStep(curStep);
+    curStep++;
+    if (curStep >= pat.len) {
+      curStep = 0;
+      if (S.playing === 'song' && S.chain.length) {
+        chainPos = (chainPos + 1) % S.chain.length;
+        S.pattern = S.chain[chainPos];
+        drawSeqTop(); drawSteps();
+      }
+    }
+    nextStepTime += stepDur();
+  }
+}
+let chainPos = 0;
+
+function click(t, accent) {
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.frequency.value = accent ? 1568 : 1046;
+  g.gain.setValueAtTime(.25, t); g.gain.exponentialRampToValueAtTime(.001, t + .04);
+  o.connect(g); g.connect(master.out); o.start(t); o.stop(t + .05);
+}
+
+async function play(song = false) {
+  await ensureAudio();
+  S.playing = song ? 'song' : true;
+  if (song && S.chain.length) { chainPos = 0; S.pattern = S.chain[0]; }
+  curStep = 0; nextStepTime = ctx.currentTime + .06;
+  schedTimer = setInterval(schedule, TICK);
+  $('#btnPlay').classList.add('on'); $('#btnPlay').textContent = '■';
+}
+function stop() {
+  S.playing = false;
+  clearInterval(schedTimer);
+  stopAllPads();
+  if (master.gate) master.gate.gain.cancelScheduledValues(0), master.gate.gain.value = 1;
+  $('#btnPlay').classList.remove('on'); $('#btnPlay').textContent = '▶';
+  $$('.step.cur').forEach(el => el.classList.remove('cur'));
+}
+
+function liveRecordNote(idx) {
+  if (!S.playing || !S.noteRec) return;
+  const pat = S.patterns[S.pattern];
+  if (!pat.steps[idx]) pat.steps[idx] = new Uint8Array(64);
+  const pos = (ctx.currentTime - (nextStepTime - stepDur() * (curStep === 0 ? pat.len : curStep))) / stepDur();
+  let st = Math.round(pos) % pat.len; if (st < 0) st += pat.len;
+  pat.steps[idx][st] = 1;
+  drawRowChips(); drawSteps(); dirty();
+}
+
+/* ------------------------------------------------ mic recording + resample */
+async function ensureMic() {
+  if (micStream) return;
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+  const src = ctx.createMediaStreamSource(micStream);
+  recNode = new AudioWorkletNode(ctx, 'cap', { numberOfInputs: 1 });
+  src.connect(recNode);
+  recNode.port.onmessage = e => onCapChunk(e.data, 'mic');
+}
+
+function onCapChunk(d, from) {
+  if (recTarget < 0) return;
+  if (recKind !== (from || 'master')) return;
+  recChunks.push(d); recLen += d.L.length;
+  let peak = 0; for (let i = 0; i < d.L.length; i += 8) peak = Math.max(peak, Math.abs(d.L[i]));
+  $('#meter').style.width = Math.min(100, peak * 130) + '%';
+  if (recLen > ctx.sampleRate * 40) stopRecording(); // safety cap 40s
+}
+
+async function startMicRecording(padIdx) {
+  await ensureAudio();
+  try { await ensureMic(); } catch (e) { toast('Microphone unavailable: ' + e.message); S.recArm = false; drawTopbar(); return; }
+  recKind = 'mic'; recChunks = []; recLen = 0; recTarget = padIdx;
+  recNode.port.postMessage('start');
+  S.recordingPad = padIdx; drawPads(); drawTopbar();
+  toast('Recording pad ' + padLabel(padIdx) + ' — tap again to stop');
+}
+
+function startResample() {
+  recKind = 'master'; recChunks = []; recLen = 0;
+  let padIdx = S.pads.findIndex(p => !p.buf);
+  if (padIdx < 0) { toast('No empty pad'); return; }
+  recTarget = padIdx;
+  master.cap.port.postMessage('start');
+  $('#resampleBar').classList.add('on');
+  toast('Resampling into pad ' + padLabel(padIdx));
+}
+
+function stopRecording() {
+  if (recTarget < 0) return;
+  const padIdx = recTarget; recTarget = -1;
+  if (recKind === 'mic') recNode.port.postMessage('stop');
+  else { master.cap.port.postMessage('stop'); $('#resampleBar').classList.remove('on'); }
+  $('#meter').style.width = '0';
+  if (recLen < 256) { toast('Too short'); S.recordingPad = -1; drawPads(); return; }
+  const buf = ctx.createBuffer(2, recLen, ctx.sampleRate);
+  const L = buf.getChannelData(0), R = buf.getChannelData(1);
+  let o = 0;
+  for (const c of recChunks) { L.set(c.L, o); R.set(c.R, o); o += c.L.length; }
+  recChunks = [];
+  const p = S.pads[padIdx];
+  p.buf = buf; p.start = 0; p.end = 1;
+  p.name = (recKind === 'mic' ? 'mic ' : 'rsmp ') + new Date().toTimeString().slice(0, 8);
+  S.recordingPad = -1; S.recArm = false; S.selPad = padIdx;
+  drawTopbar(); drawPads(); drawEdit(); dirty();
+  toast('Sampled → pad ' + padLabel(padIdx));
+}
+
+/* ------------------------------------------------ import */
+$('#fileIn').addEventListener('change', async e => {
+  const f = e.target.files[0]; e.target.value = '';
+  if (!f) return;
+  await ensureAudio();
+  try {
+    const ab = await f.arrayBuffer();
+    const buf = await ctx.decodeAudioData(ab);
+    const p = S.pads[S.selPad];
+    p.buf = buf; p.start = 0; p.end = 1; p.name = f.name.replace(/\.[^.]+$/, '').slice(0, 24);
+    drawPads(); drawEdit(); dirty();
+    toast('Imported → pad ' + padLabel(S.selPad));
+  } catch (err) { toast('Could not decode this file'); }
+});
+
+/* ------------------------------------------------ WAV + export */
+function encodeWav(chL, chR, sr) {
+  const n = chL.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); ws(8, 'WAVE'); ws(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true);
+  v.setUint32(24, sr, true); v.setUint32(28, sr * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  ws(36, 'data'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) {
+    v.setInt16(o, clamp(chL[i], -1, 1) * 32767, true); o += 2;
+    v.setInt16(o, clamp(chR[i], -1, 1) * 32767, true); o += 2;
+  }
+  return buf;
+}
+
+function saveWav(arrayBuf, name) {
+  if (window.__TEST_CAPTURE) { window.__lastWav = { buf: arrayBuf, name }; toast('test-captured ' + name); return; }
+  if (window.GibbonBridge && GibbonBridge.saveFile) {
+    // chunked base64 to avoid giant single string ops
+    const bytes = new Uint8Array(arrayBuf); let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    GibbonBridge.saveFile(name, btoa(bin));
+    toast('Saved to Downloads: ' + name);
+  } else {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([arrayBuf], { type: 'audio/wav' }));
+    a.download = name; a.click();
+    toast('Exported ' + name);
+  }
+}
+
+async function renderPatterns(patIdxList, name) {
+  await ensureAudio();
+  let total = 0;
+  const spans = patIdxList.map(pi => { const s = S.patterns[pi].len * stepDur(); const r = { pi, at: total, len: S.patterns[pi].len }; total += s; return r; });
+  const sr = ctx.sampleRate, oc = new OfflineAudioContext(2, Math.ceil((total + 2) * sr), sr);
+  const comp = oc.createDynamicsCompressor();
+  comp.threshold.value = -12; comp.ratio.value = 4; comp.attack.value = .003; comp.release.value = .12;
+  comp.connect(oc.destination);
+  for (const span of spans) {
+    const pat = S.patterns[span.pi];
+    for (const k in pat.steps) {
+      for (let st = 0; st < span.len; st++) {
+        if (!pat.steps[k][st]) continue;
+        let t = span.at + st * stepDur();
+        if (st % 2 === 1) t += stepDur() * (S.swing / 100) * .75;
+        triggerPad(+k, t, undefined, comp, oc);
+      }
+    }
+  }
+  toast('Rendering…');
+  const out = await oc.startRendering();
+  saveWav(encodeWav(out.getChannelData(0), out.getChannelData(1), sr), name);
+}
+
+function exportPad() {
+  const p = S.pads[S.selPad];
+  if (!p.buf) { toast('Selected pad is empty'); return; }
+  const b = p.buf, s = Math.floor(p.start * b.length), e = Math.floor(p.end * b.length);
+  const L = b.getChannelData(0).slice(s, e);
+  const R = (b.numberOfChannels > 1 ? b.getChannelData(1) : b.getChannelData(0)).slice(s, e);
+  saveWav(encodeWav(L, R, b.sampleRate), safeName(p.name || 'pad') + '.wav');
+}
+const safeName = n => n.replace(/[^\w\- ]+/g, '').trim().replace(/\s+/g, '-') || 'gibbon';
+
+/* ------------------------------------------------ persistence (IndexedDB) */
+let db = null;
+function idb() {
+  return new Promise((res, rej) => {
+    if (db) return res(db);
+    const rq = indexedDB.open('gibbon', 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore('projects');
+    rq.onsuccess = () => { db = rq.result; res(db); };
+    rq.onerror = () => rej(rq.error);
+  });
+}
+function serialize() {
+  return {
+    v: 1, bpm: S.bpm, swing: S.swing, chain: S.chain.slice(), patLenDefault: S.patLen,
+    scale: S.scale, name: S.projName,
+    patterns: S.patterns.map(p => ({ len: p.len, steps: Object.fromEntries(Object.entries(p.steps).map(([k, v]) => [k, Array.from(v)])) })),
+    pads: S.pads.map(p => !p.buf ? null : {
+      name: p.name, gain: p.gain, pan: p.pan, semis: p.semis, mode: p.mode, choke: p.choke,
+      start: p.start, end: p.end, sr: p.buf.sampleRate,
+      L: p.buf.getChannelData(0).slice(0), R: (p.buf.numberOfChannels > 1 ? p.buf.getChannelData(1) : p.buf.getChannelData(0)).slice(0),
+    }),
+  };
+}
+async function saveProject(key) {
+  const d = await idb();
+  await new Promise((res, rej) => {
+    const tx = d.transaction('projects', 'readwrite');
+    tx.objectStore('projects').put(serialize(), key);
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  });
+}
+async function loadProject(key) {
+  const d = await idb();
+  const data = await new Promise((res, rej) => {
+    const rq = d.transaction('projects').objectStore('projects').get(key);
+    rq.onsuccess = () => res(rq.result); rq.onerror = () => rej(rq.error);
+  });
+  if (!data) return false;
+  await ensureAudio();
+  S.bpm = data.bpm; S.swing = data.swing; S.chain = data.chain || []; S.scale = data.scale || 'pmin';
+  S.projName = data.name || key;
+  S.patterns = data.patterns.map(p => ({ len: p.len, steps: Object.fromEntries(Object.entries(p.steps).map(([k, v]) => [k, Uint8Array.from(v)])) }));
+  while (S.patterns.length < NUM_PATTERNS) S.patterns.push({ len: 16, steps: {} });
+  S.pads = data.pads.map(p => {
+    if (!p) return newPad();
+    const buf = ctx.createBuffer(2, p.L.length, p.sr);
+    buf.getChannelData(0).set(p.L); buf.getChannelData(1).set(p.R);
+    return { buf, name: p.name, gain: p.gain, pan: p.pan, semis: p.semis, mode: p.mode, choke: p.choke, start: p.start, end: p.end };
+  });
+  while (S.pads.length < NUM_PADS) S.pads.push(newPad());
+  S.pattern = 0; S.selPad = S.pads.findIndex(p => p.buf); if (S.selPad < 0) S.selPad = 0;
+  drawAll();
+  return true;
+}
+async function listProjects() {
+  const d = await idb();
+  return new Promise(res => {
+    const rq = d.transaction('projects').objectStore('projects').getAllKeys();
+    rq.onsuccess = () => res(rq.result.filter(k => k !== '__auto'));
+  });
+}
+async function deleteProject(key) {
+  const d = await idb();
+  return new Promise(res => {
+    const tx = d.transaction('projects', 'readwrite');
+    tx.objectStore('projects').delete(key); tx.oncomplete = res;
+  });
+}
+let dirtyTimer = 0;
+function dirty() {
+  clearTimeout(dirtyTimer);
+  dirtyTimer = setTimeout(() => { if (ctx) saveProject('__auto').catch(() => {}); }, 2500);
+}
+
+/* ------------------------------------------------ UI: topbar */
+function drawTopbar() {
+  $('#bpmVal').innerHTML = S.bpm + '<small> bpm</small>';
+  $('#btnRec').classList.toggle('on', S.recArm || S.recordingPad >= 0);
+  $('#btnMetro').classList.toggle('on', S.metro);
+}
+$('#bpmUp').onclick = () => { S.bpm = clamp(S.bpm + 1, 40, 240); drawTopbar(); dirty(); };
+$('#bpmDown').onclick = () => { S.bpm = clamp(S.bpm - 1, 40, 240); drawTopbar(); dirty(); };
+let holdIv = 0;
+for (const [id, d] of [['#bpmUp', 1], ['#bpmDown', -1]]) {
+  $(id).addEventListener('pointerdown', () => { holdIv = setInterval(() => { S.bpm = clamp(S.bpm + d, 40, 240); drawTopbar(); }, 90); });
+  $(id).addEventListener('pointerup', () => { clearInterval(holdIv); dirty(); });
+  $(id).addEventListener('pointerleave', () => clearInterval(holdIv));
+}
+let taps = [];
+$('#btnTap').onclick = () => {
+  const now = performance.now();
+  taps = taps.filter(t => now - t < 3000); taps.push(now);
+  if (taps.length >= 3) {
+    const iv = (taps[taps.length - 1] - taps[0]) / (taps.length - 1);
+    S.bpm = clamp(Math.round(60000 / iv), 40, 240); drawTopbar(); dirty();
+  }
+};
+$('#btnMetro').onclick = () => { S.metro = !S.metro; drawTopbar(); };
+$('#btnPlay').onclick = async () => { if (S.playing) stop(); else await play(); };
+$('#btnRec').onclick = async () => {
+  await ensureAudio();
+  if (S.recordingPad >= 0) { stopRecording(); return; }
+  S.recArm = !S.recArm; drawTopbar();
+  toast(S.recArm ? 'Armed — tap a pad to record from mic' : 'Disarmed');
+};
+$('#btnResampleStop').onclick = stopRecording;
+
+/* ------------------------------------------------ UI: tabs */
+$$('.tab').forEach(t => t.onclick = () => {
+  $$('.tab').forEach(x => x.classList.remove('on'));
+  $$('.page').forEach(x => x.classList.remove('on'));
+  t.classList.add('on');
+  $('#page-' + t.dataset.page).classList.add('on');
+  if (t.dataset.page === 'edit') drawEdit();
+  if (t.dataset.page === 'seq') { drawSeqTop(); drawRowChips(); drawSteps(); }
+});
+function gotoTab(name) { $$('.tab').find(t => t.dataset.page === name).click(); }
+
+/* ------------------------------------------------ UI: pads */
+const bankRow = $('#bankRow'), padGrid = $('#padGrid');
+for (let b = 0; b < NUM_BANKS; b++) {
+  const el = document.createElement('div');
+  el.className = 'bank'; el.textContent = 'BANK ' + 'ABCD'[b];
+  el.onclick = () => { S.bank = b; drawPads(); };
+  bankRow.appendChild(el);
+}
+const padEls = [];
+for (let i = 0; i < PADS_PER_BANK; i++) {
+  const el = document.createElement('div');
+  el.className = 'pad'; el.innerHTML = '<span class="lbl"></span><span class="num"></span>';
+  padGrid.appendChild(el); padEls.push(el);
+  let lpTimer = 0, played = false;
+  el.addEventListener('pointerdown', async ev => {
+    ev.preventDefault(); played = false;
+    await ensureAudio();
+    const idx = S.bank * PADS_PER_BANK + i;
+    lpTimer = setTimeout(() => { lpTimer = 0; S.selPad = idx; drawPads(); gotoTab('edit'); }, 480);
+    if (S.recArm && S.recordingPad < 0) { clearTimeout(lpTimer); lpTimer = 0; startMicRecording(idx); return; }
+    if (S.recordingPad === idx) { clearTimeout(lpTimer); lpTimer = 0; stopRecording(); return; }
+    const p = S.pads[idx];
+    if (!p.buf) { S.selPad = idx; drawPads(); return; }
+    S.selPad = idx; played = true;
+    if (p.mode === 'loop' && activeSrc.get(idx) && activeSrc.get(idx).length) { stopPad(idx); drawPads(); return; }
+    triggerPad(idx, 0, S.keys ? i : undefined);
+    liveRecordNote(idx);
+    el.classList.add('lit'); setTimeout(() => el.classList.remove('lit'), 130);
+    drawPads();
+  });
+  const up = () => {
+    if (lpTimer) { clearTimeout(lpTimer); lpTimer = 0; }
+    const idx = S.bank * PADS_PER_BANK + i;
+    if (played && S.pads[idx].mode === 'gate') stopPad(idx);
+  };
+  el.addEventListener('pointerup', up);
+  el.addEventListener('pointerleave', up);
+}
+function padLabel(idx) { return 'ABCD'[Math.floor(idx / PADS_PER_BANK)] + (idx % PADS_PER_BANK + 1); }
+function drawPads() {
+  $$('.bank').forEach((el, b) => el.classList.toggle('on', b === S.bank));
+  for (let i = 0; i < PADS_PER_BANK; i++) {
+    const idx = S.bank * PADS_PER_BANK + i, p = S.pads[idx], el = padEls[i];
+    el.classList.toggle('filled', !!p.buf);
+    el.classList.toggle('sel', idx === S.selPad);
+    el.classList.toggle('armed', idx === S.recordingPad);
+    el.querySelector('.lbl').textContent = p.buf ? (p.name || 'sample') : '';
+    el.querySelector('.num').textContent = padLabel(idx);
+  }
+}
+
+/* ------------------------------------------------ UI: sequencer */
+function drawSeqTop() {
+  const el = $('#seqTop'); el.innerHTML = '';
+  for (let i = 0; i < NUM_PATTERNS; i++) {
+    const b = document.createElement('button');
+    b.className = 'patBtn' + (i === S.pattern ? ' on' : '');
+    b.textContent = 'P' + (i + 1);
+    b.onclick = () => { S.pattern = i; curStep = 0; drawSeqTop(); drawRowChips(); drawSteps(); };
+    el.appendChild(b);
+  }
+  const len = document.createElement('button');
+  len.className = 'seq-ctl'; len.textContent = S.patterns[S.pattern].len + ' steps';
+  len.onclick = () => {
+    const p = S.patterns[S.pattern];
+    p.len = p.len === 16 ? 32 : p.len === 32 ? 64 : 16;
+    for (const k in p.steps) { if (p.steps[k].length < 64) { const n = new Uint8Array(64); n.set(p.steps[k]); p.steps[k] = n; } }
+    curStep = 0; drawSeqTop(); drawSteps(); dirty();
+  };
+  el.appendChild(len);
+  const rec = document.createElement('button');
+  rec.className = 'seq-ctl' + (S.noteRec ? ' on' : ''); rec.textContent = '● REC NOTES';
+  rec.onclick = () => { S.noteRec = !S.noteRec; drawSeqTop(); };
+  el.appendChild(rec);
+  const clr = document.createElement('button');
+  clr.className = 'seq-ctl'; clr.textContent = 'CLEAR PAT';
+  clr.onclick = () => { S.patterns[S.pattern].steps = {}; drawRowChips(); drawSteps(); dirty(); };
+  el.appendChild(clr);
+}
+function drawRowChips() {
+  const el = $('#rowChips'); el.innerHTML = '';
+  const pat = S.patterns[S.pattern];
+  const idxs = new Set(Object.keys(pat.steps).map(Number).filter(k => pat.steps[k].some(v => v)));
+  idxs.add(S.selPad);
+  [...idxs].sort((a, b) => a - b).forEach(idx => {
+    const c = document.createElement('button');
+    c.className = 'chip' + (idx === S.selPad ? ' on' : '');
+    c.textContent = padLabel(idx) + (S.pads[idx].name ? ' · ' + S.pads[idx].name.slice(0, 10) : '');
+    c.onclick = () => { S.selPad = idx; drawRowChips(); drawSteps(); drawPads(); };
+    el.appendChild(c);
+  });
+}
+function drawSteps() {
+  const el = $('#stepWrap'); el.innerHTML = '';
+  const pat = S.patterns[S.pattern];
+  if (!pat.steps[S.selPad]) pat.steps[S.selPad] = new Uint8Array(64);
+  const arr = pat.steps[S.selPad];
+  for (let r = 0; r < pat.len / 8; r++) {
+    const row = document.createElement('div'); row.className = 'stepRow';
+    for (let c = 0; c < 8; c++) {
+      const st = r * 8 + c, s = document.createElement('div');
+      s.className = 'step' + (st % 4 === 0 ? ' beat' : '') + (arr[st] ? ' on' : '');
+      s.dataset.st = st;
+      s.onclick = () => { arr[st] = arr[st] ? 0 : 1; s.classList.toggle('on', !!arr[st]); drawRowChips(); dirty(); };
+      row.appendChild(s);
+    }
+    el.appendChild(row);
+  }
+}
+function uiStep(st) {
+  if (!$('#page-seq').classList.contains('on')) return;
+  requestAnimationFrame(() => {
+    $$('.step.cur').forEach(e => e.classList.remove('cur'));
+    const el = document.querySelector('.step[data-st="' + st + '"]');
+    if (el) el.classList.add('cur');
+  });
+}
+$('#swing').oninput = e => { S.swing = +e.target.value; $('#swingOut').textContent = S.swing + '%'; dirty(); };
+
+/* ------------------------------------------------ UI: FX */
+const FX = {
+  lpf:   { label: 'LO-PASS' }, hpf: { label: 'HI-PASS' }, delay: { label: 'DELAY' },
+  verb:  { label: 'REVERB' }, crush: { label: 'CRUSH' }, gate: { label: 'GATE' },
+};
+const gateParams = { div: 2, depth: 0 };
+const fxGrid = $('#fxGrid');
+for (const key in FX) {
+  const b = document.createElement('button');
+  b.className = 'fxBtn'; b.textContent = FX[key].label; b.dataset.fx = key;
+  b.addEventListener('pointerdown', async ev => {
+    ev.preventDefault(); await ensureAudio();
+    if (S.fxLatch && S.fx === key) { clearFx(); return; }
+    S.fx = key; applyFx(); drawFx();
+  });
+  b.addEventListener('pointerup', () => { if (!S.fxLatch) clearFx(); });
+  fxGrid.appendChild(b);
+}
+function drawFx() {
+  $$('.fxBtn').forEach(b => b.classList.toggle('on', b.dataset.fx === S.fx));
+  $('#btnLatch').textContent = 'LATCH: ' + (S.fxLatch ? 'ON' : 'OFF');
+  $('#btnLatch').classList.toggle('on', S.fxLatch);
+  const d = $('#xyDot');
+  d.style.left = S.fxXY.x * 100 + '%'; d.style.top = S.fxXY.y * 100 + '%';
+  $('#xyLabel').textContent = S.fx ? FX[S.fx].label + ' — x/y morph' : 'hold an FX, drag to perform';
+}
+function applyFx() {
+  if (!ctx) return;
+  const { x, y } = S.fxXY, t = ctx.currentTime, m = master;
+  const fast = (p, v) => p.setTargetAtTime(v, t, .02);
+  // reset all
+  fast(m.lp.frequency, 20000); fast(m.lp.Q, .7);
+  fast(m.hp.frequency, 10); fast(m.hp.Q, .7);
+  fast(m.dSend.gain, 0); fast(m.rSend.gain, 0);
+  m.crush.port.postMessage({ wet: 0 });
+  gateParams.depth = 0;
+  if (!S.playing) { m.gate.gain.cancelScheduledValues(t); fast(m.gate.gain, 1); }
+  switch (S.fx) {
+    case 'lpf': fast(m.lp.frequency, 80 * Math.pow(250, x)); fast(m.lp.Q, .7 + (1 - y) * 11); break;
+    case 'hpf': fast(m.hp.frequency, 40 * Math.pow(250, x)); fast(m.hp.Q, .7 + (1 - y) * 11); break;
+    case 'delay': {
+      const beats = [1, .75, .5, .375, .25, .125][Math.floor(x * 5.99)];
+      fast(m.delay.delayTime, clamp(stepDur() * 4 * beats, .02, 2));
+      fast(m.dFb.gain, .2 + (1 - y) * .65); fast(m.dSend.gain, .6); break;
+    }
+    case 'verb': fast(m.rSend.gain, x * 1.2); fast(m.dTone.frequency, 4000); break;
+    case 'crush': m.crush.port.postMessage({ wet: 1, bits: Math.round(12 - x * 9), down: 1 + Math.round((1 - y) * 24) }); break;
+    case 'gate': gateParams.div = [8, 4, 2, 1][Math.floor(x * 3.99)]; gateParams.depth = .3 + (1 - y) * .7; break;
+  }
+}
+function clearFx() {
+  S.fx = null; applyFx(); drawFx();
+  if (ctx && !S.playing) { master.gate.gain.cancelScheduledValues(ctx.currentTime); master.gate.gain.value = 1; }
+}
+$('#btnLatch').onclick = () => { S.fxLatch = !S.fxLatch; if (!S.fxLatch) clearFx(); drawFx(); };
+$('#btnFxClear').onclick = clearFx;
+const xy = $('#xyPad');
+function xyMove(ev) {
+  const r = xy.getBoundingClientRect();
+  S.fxXY.x = clamp((ev.clientX - r.left) / r.width, 0, 1);
+  S.fxXY.y = clamp((ev.clientY - r.top) / r.height, 0, 1);
+  applyFx(); drawFx();
+}
+xy.addEventListener('pointerdown', ev => { xy.setPointerCapture(ev.pointerId); xyMove(ev); });
+xy.addEventListener('pointermove', ev => { if (ev.buttons) xyMove(ev); });
+
+/* ------------------------------------------------ UI: edit */
+const wave = $('#waveCanvas'), wctx = wave.getContext('2d');
+let dragHandle = null;
+function drawEdit() {
+  const p = S.pads[S.selPad];
+  $('#editTitle').textContent = padLabel(S.selPad) + (p.name ? ' · ' + p.name : ' · empty');
+  $('#editMeta').textContent = p.buf ? p.buf.duration.toFixed(2) + 's @ ' + p.buf.sampleRate + 'Hz' : '';
+  $('#cGain').value = Math.round(p.gain * 100); $('#oGain').textContent = Math.round(p.gain * 100) + '%';
+  $('#cPitch').value = p.semis; $('#oPitch').textContent = p.semis + ' st';
+  $('#cPan').value = Math.round(p.pan * 100); $('#oPan').textContent = p.pan === 0 ? 'C' : (p.pan < 0 ? 'L' : 'R') + Math.abs(Math.round(p.pan * 100));
+  $('#bMode').textContent = { oneshot: 'ONE-SHOT', gate: 'GATE', loop: 'LOOP' }[p.mode];
+  $('#bChoke').textContent = 'CHOKE: ' + (p.choke ? p.choke : '–');
+  $('#bKeys').textContent = 'KEYBOARD MODE: ' + (S.keys ? 'ON' : 'OFF');
+  $('#bKeys').classList.toggle('on', S.keys);
+  $('#selScale').value = S.scale;
+  drawWave();
+}
+function drawWave() {
+  const p = S.pads[S.selPad];
+  const W = wave.width = wave.clientWidth * devicePixelRatio, H = wave.height = wave.clientHeight * devicePixelRatio;
+  wctx.clearRect(0, 0, W, H);
+  if (!p.buf) {
+    wctx.fillStyle = '#3a4258'; wctx.font = 12 * devicePixelRatio + 'px sans-serif'; wctx.textAlign = 'center';
+    wctx.fillText('empty — record (●) or IMPORT', W / 2, H / 2);
+    return;
+  }
+  const d = p.buf.getChannelData(0), step = Math.max(1, Math.floor(d.length / W));
+  wctx.strokeStyle = '#5b8bd9'; wctx.lineWidth = 1; wctx.beginPath();
+  for (let x = 0; x < W; x++) {
+    let mn = 1, mx = -1;
+    const base = x * step;
+    for (let i = 0; i < step; i += Math.max(1, step >> 4)) { const v = d[base + i] || 0; if (v < mn) mn = v; if (v > mx) mx = v; }
+    wctx.moveTo(x, H / 2 + mn * H * .48); wctx.lineTo(x, H / 2 + mx * H * .48 + 1);
+  }
+  wctx.stroke();
+  // dim outside trim, draw handles
+  wctx.fillStyle = 'rgba(8,10,16,.72)';
+  wctx.fillRect(0, 0, p.start * W, H); wctx.fillRect(p.end * W, 0, W - p.end * W, H);
+  for (const [pos, col] of [[p.start, '#3ddc97'], [p.end, '#ffb02e']]) {
+    wctx.fillStyle = col;
+    wctx.fillRect(pos * W - 1.5 * devicePixelRatio, 0, 3 * devicePixelRatio, H);
+    wctx.beginPath(); wctx.arc(pos * W, H - 12 * devicePixelRatio, 8 * devicePixelRatio, 0, 7); wctx.fill();
+  }
+}
+$('#waveBox').addEventListener('pointerdown', ev => {
+  const p = S.pads[S.selPad]; if (!p.buf) return;
+  const r = wave.getBoundingClientRect(), x = (ev.clientX - r.left) / r.width;
+  dragHandle = Math.abs(x - p.start) < Math.abs(x - p.end) ? 'start' : 'end';
+  $('#waveBox').setPointerCapture(ev.pointerId);
+  moveHandle(x);
+});
+$('#waveBox').addEventListener('pointermove', ev => {
+  if (dragHandle === null || !ev.buttons) return;
+  const r = wave.getBoundingClientRect();
+  moveHandle((ev.clientX - r.left) / r.width);
+});
+$('#waveBox').addEventListener('pointerup', () => { dragHandle = null; dirty(); });
+function moveHandle(x) {
+  const p = S.pads[S.selPad]; x = clamp(x, 0, 1);
+  if (dragHandle === 'start') p.start = Math.min(x, p.end - .005);
+  else p.end = Math.max(x, p.start + .005);
+  drawWave();
+}
+$('#cGain').oninput = e => { S.pads[S.selPad].gain = e.target.value / 100; $('#oGain').textContent = e.target.value + '%'; dirty(); };
+$('#cPitch').oninput = e => { S.pads[S.selPad].semis = +e.target.value; $('#oPitch').textContent = e.target.value + ' st'; dirty(); };
+$('#cPan').oninput = e => { const p = S.pads[S.selPad]; p.pan = e.target.value / 100; $('#oPan').textContent = p.pan === 0 ? 'C' : (p.pan < 0 ? 'L' : 'R') + Math.abs(e.target.value); dirty(); };
+$('#bMode').onclick = () => { const p = S.pads[S.selPad]; p.mode = { oneshot: 'gate', gate: 'loop', loop: 'oneshot' }[p.mode]; drawEdit(); dirty(); };
+$('#bChoke').onclick = () => { const p = S.pads[S.selPad]; p.choke = (p.choke + 1) % 5; drawEdit(); dirty(); };
+$('#bReverse').onclick = () => {
+  const p = S.pads[S.selPad]; if (!p.buf) return;
+  for (let c = 0; c < p.buf.numberOfChannels; c++) p.buf.getChannelData(c).reverse();
+  const s = p.start; p.start = 1 - p.end; p.end = 1 - s;
+  drawWave(); dirty();
+};
+$('#bNorm').onclick = () => {
+  const p = S.pads[S.selPad]; if (!p.buf) return;
+  let peak = 0;
+  for (let c = 0; c < p.buf.numberOfChannels; c++) { const d = p.buf.getChannelData(c); for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i])); }
+  if (peak > 0.0001) { const k = .98 / peak; for (let c = 0; c < p.buf.numberOfChannels; c++) { const d = p.buf.getChannelData(c); for (let i = 0; i < d.length; i++) d[i] *= k; } }
+  drawWave(); dirty(); toast('Normalized');
+};
+$('#bCrop').onclick = () => {
+  const p = S.pads[S.selPad]; if (!p.buf) return;
+  const s = Math.floor(p.start * p.buf.length), e = Math.floor(p.end * p.buf.length);
+  if (e - s < 64) return;
+  const nb = ctx.createBuffer(p.buf.numberOfChannels, e - s, p.buf.sampleRate);
+  for (let c = 0; c < p.buf.numberOfChannels; c++) nb.getChannelData(c).set(p.buf.getChannelData(c).slice(s, e));
+  p.buf = nb; p.start = 0; p.end = 1;
+  drawEdit(); dirty(); toast('Cropped');
+};
+$('#bImport').onclick = () => $('#fileIn').click();
+$('#bCopy').onclick = () => {
+  const p = S.pads[S.selPad]; if (!p.buf) { toast('Nothing to copy'); return; }
+  S.clipboard = { ...p };
+  toast('Copied ' + padLabel(S.selPad));
+};
+$('#bPaste').onclick = () => {
+  if (!S.clipboard) { toast('Clipboard empty'); return; }
+  S.pads[S.selPad] = { ...S.clipboard };
+  drawPads(); drawEdit(); dirty(); toast('Pasted → ' + padLabel(S.selPad));
+};
+$('#bClear').onclick = () => {
+  stopPad(S.selPad);
+  S.pads[S.selPad] = newPad();
+  drawPads(); drawEdit(); dirty(); toast('Cleared ' + padLabel(S.selPad));
+};
+$('#bKeys').onclick = () => { S.keys = !S.keys; drawEdit(); toast(S.keys ? 'Pads now play ' + padLabel(S.selPad) + ' chromatically' : 'Pads back to normal'); };
+$('#selScale').onchange = e => { S.scale = e.target.value; dirty(); };
+
+/* ------------------------------------------------ UI: menu */
+$('#btnMenu').onclick = () => { $('#menu').classList.add('on'); drawMenu(); };
+$('#mClose').onclick = () => $('#menu').classList.remove('on');
+$('#menu').addEventListener('click', e => { if (e.target.id === 'menu') $('#menu').classList.remove('on'); });
+async function drawMenu() {
+  $('#projName').value = S.projName;
+  $('#verLabel').textContent = VERSION + (window.GibbonBridge ? ' · android' : ' · web');
+  const keys = await listProjects().catch(() => []);
+  const el = $('#projList'); el.innerHTML = '';
+  keys.forEach(k => {
+    const row = document.createElement('div'); row.className = 'projItem';
+    const b = document.createElement('button'); b.className = 'mbtn'; b.textContent = '▸ ' + k;
+    b.onclick = async () => { if (await loadProject(k)) { $('#menu').classList.remove('on'); toast('Loaded ' + k); } };
+    const d = document.createElement('button'); d.className = 'mbtn del'; d.textContent = '✕';
+    d.onclick = async () => { await deleteProject(k); drawMenu(); };
+    row.appendChild(b); row.appendChild(d); el.appendChild(row);
+  });
+  drawChain();
+}
+$('#projName').addEventListener('input', e => { S.projName = e.target.value.trim() || 'untitled'; });
+$('#mSave').onclick = async () => { await ensureAudio(); await saveProject(S.projName); drawMenu(); toast('Saved "' + S.projName + '"'); };
+$('#mNew').onclick = () => {
+  stop();
+  S.pads = []; for (let i = 0; i < NUM_PADS; i++) S.pads.push(newPad());
+  S.patterns = []; for (let i = 0; i < NUM_PATTERNS; i++) S.patterns.push({ len: 16, steps: {} });
+  S.chain = []; S.pattern = 0; S.selPad = 0; S.projName = 'untitled';
+  drawAll(); $('#menu').classList.remove('on'); toast('New project');
+};
+$('#mExportLoop').onclick = () => { $('#menu').classList.remove('on'); renderPatterns([S.pattern], safeName(S.projName) + '-loop.wav'); };
+$('#mExportSong').onclick = () => {
+  if (!S.chain.length) { toast('Chain is empty — tap patterns below first'); return; }
+  $('#menu').classList.remove('on');
+  renderPatterns(S.chain, safeName(S.projName) + '-song.wav');
+};
+$('#mExportPad').onclick = () => { $('#menu').classList.remove('on'); exportPad(); };
+$('#mResample').onclick = async () => { await ensureAudio(); $('#menu').classList.remove('on'); startResample(); };
+function drawChain() {
+  const row = $('#chainRow'); row.innerHTML = '';
+  for (let i = 0; i < NUM_PATTERNS; i++) {
+    const b = document.createElement('button'); b.className = 'patBtn'; b.textContent = 'P' + (i + 1);
+    b.onclick = () => { S.chain.push(i); drawChain(); dirty(); };
+    row.appendChild(b);
+  }
+  $('#chainView').textContent = S.chain.length ? 'chain: ' + S.chain.map(i => 'P' + (i + 1)).join(' → ') : 'chain: (empty)';
+}
+$('#mChainClear').onclick = () => { S.chain = []; drawChain(); dirty(); };
+
+/* ------------------------------------------------ misc */
+let toastTimer = 0;
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('on');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('on'), 2200);
+}
+function drawAll() {
+  drawTopbar(); drawPads(); drawSeqTop(); drawRowChips(); drawSteps(); drawEdit(); drawFx();
+  $('#swing').value = S.swing; $('#swingOut').textContent = S.swing + '%';
+}
+window.addEventListener('resize', drawWave);
+
+/* boot: restore autosave on first interaction (audio ctx needs a gesture) */
+let booted = false;
+async function boot() {
+  if (booted) return; booted = true;
+  try { await ensureAudio(); await loadProject('__auto'); } catch (e) {}
+}
+document.addEventListener('pointerdown', boot, { once: true, capture: true });
+drawAll();
+
+/* debug/console access (harmless in production, handy on-device) */
+window.__g = {
+  get S() { return S; }, get ctx() { return ctx; },
+  ensureAudio, triggerPad, drawPads, drawEdit, drawAll, renderPatterns, saveProject, loadProject, dirty,
+};
