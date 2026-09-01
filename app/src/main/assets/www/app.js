@@ -15,7 +15,7 @@ const STEP_T = PPQ / 4;       // one 16th = 24 ticks (grid view unit)
 const TC = { '16': 24, '8': 48, '8T': 32, '16T': 16, '32': 12, '32T': 8, 'OFF': null };
 const TC_ORDER = ['16', '8', '8T', '16T', '32', '32T', 'OFF'];
 const SCALES = { chrom: [0,1,2,3,4,5,6,7,8,9,10,11], major: [0,2,4,5,7,9,11], minor: [0,2,3,5,7,8,10], pmin: [0,3,5,7,10], pmaj: [0,2,4,7,9] };
-const VERSION = 'v4';
+const VERSION = 'v4.1';
 
 /* ------------------------------------------------ state */
 const S = {
@@ -522,8 +522,19 @@ function finalizeChopRecording() {
   C.buf = buf; C.sr = ctx.sampleRate; C.markers = []; C.z = 1; C.off = 0; C.lastTap = -1;
   $('#chZoom').value = 0; $('#chZoomOut').textContent = '1×';
   drawChop(); dirty(); saveChopSource();
-  toast('Captured ' + fmtTime(buf.duration) + ' — now slice it');
+  $('#chopGo').classList.add('on'); // one-tap quick path: auto-slice + spread to pads
 }
+$('#chopGoBtn').onclick = () => {
+  $('#chopGo').classList.remove('on');
+  if (!C.buf) return;
+  autoSlice();
+  if (!C.markers.length) { // uneventful texture — fall back to 8 equal cuts
+    C.markers = []; for (let i = 1; i < 8; i++) C.markers.push(i / 8);
+    drawChop();
+  }
+  chopToPads();
+};
+$('#chopGoX').onclick = () => $('#chopGo').classList.remove('on');
 $('#chRec').onclick = () => { if (recTarget === CHOP_TARGET) stopRecording(); else startChopRecording(); };
 $('#chImport').onclick = () => { importDest = 'chop'; $('#fileIn').click(); };
 
@@ -595,7 +606,8 @@ $('#chAdd').onclick = () => {
   if (C.lastTap < 0) { toast('Tap the wave first to place the cursor'); return; }
   C.markers.push(C.lastTap); drawChop(); dirty();
 };
-$('#chToPads').onclick = () => {
+$('#chToPads').onclick = () => chopToPads();
+function chopToPads() {
   if (!C.buf) { toast('Record or import first'); return; }
   const bs = [0, ...sortedMarkers(), 1], d = C.buf.getChannelData(0);
   const slices = [];
@@ -616,7 +628,7 @@ $('#chToPads').onclick = () => {
   drawPads(); dirty();
   toast(assigned + ' slices → pads' + (assigned < slices.length ? ' (' + (slices.length - assigned) + " didn't fit)" : ''));
   gotoTab('pads');
-};
+}
 $('#chKeep').onclick = () => {
   if (!C.buf) { toast('Record or import first'); return; }
   const idx = S.pads.findIndex(p => !p.buf);
@@ -1023,11 +1035,28 @@ $('#btnTap').onclick = () => {
 };
 $('#btnMetro').onclick = () => { S.metro = !S.metro; drawTopbar(); };
 $('#btnPlay').onclick = async () => { if (S.playing) stop(); else await play(); };
+/* ● button: tap = arm pad-sampling (or stop any recording); HOLD = start a
+ * field recording instantly from any page — the moment on the street is short */
+let recHoldTimer = 0, recHoldFired = false;
+$('#btnRec').addEventListener('pointerdown', () => {
+  recHoldFired = false;
+  if (recTarget !== -1) return; // already recording something — tap will stop it
+  recHoldTimer = setTimeout(async () => {
+    recHoldTimer = 0; recHoldFired = true;
+    await ensureAudio();
+    gotoTab('chop');
+    startChopRecording();
+  }, 450);
+});
+for (const evName of ['pointerup', 'pointerleave', 'pointercancel'])
+  $('#btnRec').addEventListener(evName, () => { if (recHoldTimer) { clearTimeout(recHoldTimer); recHoldTimer = 0; } });
 $('#btnRec').onclick = async () => {
+  if (recHoldFired) { recHoldFired = false; return; }
   await ensureAudio();
+  if (recTarget === CHOP_TARGET) { stopRecording(); return; }
   if (S.recordingPad >= 0) { stopRecording(); return; }
   S.recArm = !S.recArm; drawTopbar();
-  toast(S.recArm ? 'Armed — tap a pad to record from mic' : 'Disarmed');
+  toast(S.recArm ? 'Armed — tap a pad to record from mic (hold ● for a field recording)' : 'Disarmed');
 };
 $('#btnResampleStop').onclick = stopRecording;
 
@@ -1037,6 +1066,7 @@ $$('.tab').forEach(t => t.onclick = () => {
   $$('.page').forEach(x => x.classList.remove('on'));
   t.classList.add('on');
   $('#page-' + t.dataset.page).classList.add('on');
+  try { localStorage.setItem('sst_tab', t.dataset.page); } catch (e) {}
   if (t.dataset.page === 'edit') drawEdit();
   if (t.dataset.page === 'seq') { drawSeqTop(); drawRowChips(); drawSteps(); }
   if (t.dataset.page === 'chop') drawChop();
@@ -1148,6 +1178,9 @@ $('#pErase').onclick = () => {
 };
 function drawPads() {
   $$('.bank').forEach((el, b) => el.classList.toggle('on', b === S.bank));
+  $('#padHint').textContent = S.pads.some(p => p.buf)
+    ? 'tap ● then a pad to sample from the mic · long-press a pad to select it for EDIT'
+    : 'no sounds yet — HOLD ● to record the street, or tap ● then a pad to mic-sample · guide in ☰';
   for (let i = 0; i < PADS_PER_BANK; i++) {
     const idx = S.bank * PADS_PER_BANK + i, p = S.pads[idx], el = padEls[i];
     el.classList.toggle('filled', !!p.buf);
@@ -1534,6 +1567,8 @@ $('#selScale').onchange = e => { S.scale = e.target.value; dirty(); };
 
 /* ------------------------------------------------ UI: menu */
 $('#btnMenu').onclick = () => { $('#menu').classList.add('on'); drawMenu(); };
+$('#mGuide').onclick = () => { $('#menu').classList.remove('on'); $('#guide').classList.add('on'); };
+$('#guideClose').onclick = () => $('#guide').classList.remove('on');
 $('#mClose').onclick = () => $('#menu').classList.remove('on');
 $('#menu').addEventListener('click', e => { if (e.target.id === 'menu') $('#menu').classList.remove('on'); });
 async function drawMenu() {
@@ -1611,10 +1646,22 @@ async function boot() {
   if (booted) return; booted = true;
   try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch (e) {}
   try { await ensureAudio(); await loadProject('__auto'); await loadChopSource(); } catch (e) {}
+  try { // first run: open the workflow guide once
+    if (!localStorage.getItem('sst_seen')) { localStorage.setItem('sst_seen', '1'); $('#guide').classList.add('on'); }
+  } catch (e) {}
 }
 document.addEventListener('pointerdown', boot, { once: true, capture: true });
 document.addEventListener('pointerup', boot, { once: true, capture: true });
 drawAll();
+
+/* restore the tab you were on last time */
+try {
+  const last = localStorage.getItem('sst_tab');
+  if (last && last !== 'pads') {
+    const el = $$('.tab').find(x => x.dataset.page === last);
+    if (el) el.click();
+  }
+} catch (e) {}
 
 /* PWA: offline service worker — only on the hosted site, never inside the Android shell */
 if ('serviceWorker' in navigator && location.hostname.endsWith('github.io')) {
