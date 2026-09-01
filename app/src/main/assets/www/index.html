@@ -161,6 +161,27 @@
   #chopGo .go{margin-left:auto;background:var(--acc);color:#0b0d12;border:none;border-radius:7px;padding:7px 14px;font-size:12px;font-weight:700;}
   #chopGo .x{background:none;border:none;color:#8a7440;font-size:15px;padding:4px 6px;}
 
+  /* ---------- sound map library ---------- */
+  #lib{position:absolute;inset:0;background:var(--bg);z-index:50;display:none;flex-direction:column;}
+  #lib.on{display:flex;}
+  #libHead{display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--panel);}
+  #libHead b{font-size:13px;letter-spacing:.08em;color:var(--acc);white-space:nowrap;}
+  #libHead small{color:var(--dim);font-size:11px;}
+  #libClose{margin-left:auto;background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:7px 12px;font-size:13px;}
+  #libCtl{display:flex;gap:6px;padding:8px 10px;border-bottom:1px solid var(--line);background:var(--panel);}
+  #libSearch{flex:1;min-width:0;padding:8px 10px;border-radius:8px;background:var(--panel2);border:1px solid var(--line);color:var(--txt);font-size:13px;user-select:text;-webkit-user-select:text;}
+  #libCat{max-width:40%;padding:8px 6px;border-radius:8px;background:var(--panel2);border:1px solid var(--line);color:var(--txt);font-size:12px;}
+  #libShuffle{padding:8px 10px;border-radius:8px;background:var(--panel2);border:1px solid var(--line);color:var(--txt);font-size:13px;}
+  #libList{flex:1;overflow-y:auto;padding:8px 10px;display:flex;flex-direction:column;gap:6px;}
+  .libRow{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 10px;display:flex;align-items:center;gap:8px;}
+  .libInfo{flex:1;min-width:0;}
+  .libInfo .t{font-size:13px;color:var(--txt);overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}
+  .libInfo .m{font-size:10px;color:var(--dim);margin-top:2px;}
+  .libRow button{background:var(--panel2);border:1px solid var(--line);color:var(--txt);border-radius:7px;padding:8px 9px;font-size:11px;white-space:nowrap;flex-shrink:0;}
+  .libRow .pv{width:38px;font-size:13px;}
+  .libRow .pv.playing{background:var(--acc);border-color:var(--acc);color:#0b0d12;}
+  #libStatus{padding:20px;text-align:center;font-size:12px;color:var(--dim);}
+
   /* ---------- guide ---------- */
   #guide{position:absolute;inset:0;background:var(--bg);z-index:50;display:none;flex-direction:column;}
   #guide.on{display:flex;}
@@ -228,6 +249,7 @@
       <div id="chopTop">
         <button class="seq-ctl" id="chRec">● REC</button>
         <button class="seq-ctl" id="chImport">IMPORT</button>
+        <button class="seq-ctl" id="chLib">🗺 MAP</button>
         <button class="seq-ctl" id="chAuto">AUTO-SLICE</button>
         <button class="seq-ctl" id="chGrid">GRID 8</button>
         <button class="seq-ctl" id="chClear">CLEAR</button>
@@ -298,6 +320,7 @@
   <div id="menu">
     <div id="menuPanel">
       <button class="mbtn" id="mGuide" style="border-color:var(--acc);color:var(--acc)">📖 Workflows &amp; guide</button>
+      <button class="mbtn" id="mLib">🗺 Saigon Sound Map — sample library</button>
       <h3>PROJECT</h3>
       <input id="projName" value="untitled" spellcheck="false">
       <button class="mbtn" id="mSave">💾 Save project</button>
@@ -320,6 +343,15 @@
       <button class="mbtn" id="mClose">Close</button>
     </div>
   </div>
+  <div id="lib">
+    <div id="libHead"><b>🗺 SAIGON SOUND MAP</b><small id="libCount"></small><button id="libClose">✕ close</button></div>
+    <div id="libCtl">
+      <input id="libSearch" placeholder="search the archive…" spellcheck="false">
+      <select id="libCat"><option value="">all categories</option></select>
+      <button id="libShuffle" title="shuffle">🎲</button>
+    </div>
+    <div id="libList"><div id="libStatus">…</div></div>
+  </div>
   <div id="guide">
     <div id="guideHead"><b>WORKFLOWS</b><button id="guideClose">✕ close</button></div>
     <div id="guideBody">
@@ -334,6 +366,16 @@
           <li>Hold <b>FX</b> buttons and drag the pad to perform; <b>☰ → Export loop</b> when it bangs.</li>
         </ol>
         <p>Want finer cuts first? Open <b>CHOP</b>: tap the wave to audition a slice, drag markers, AUTO-SLICE sensitivity, GRID for equal cuts — then → PADS.</p>
+      </div>
+
+      <div class="gSec">
+        <h4>🗺 Dig the Sound Map <span>259+ Saigon field recordings as a crate</span></h4>
+        <div class="gFlow"><span class="gChip hot">☰ or CHOP → 🗺 MAP</span><span class="gArr">→</span><span class="gChip">search / category / 🎲</span><span class="gArr">→</span><span class="gChip">▶ preview</span><span class="gArr">→</span><span class="gChip hot">→ CHOP or → PAD</span></div>
+        <ol>
+          <li>The whole <b>Saigon Sound Map</b> archive is your sample library — street vendors, waterways, rituals, markets — searchable by word or category, 🎲 shuffles for surprise.</li>
+          <li><b>→ CHOP</b> drops a recording into the chop lab (slice it like your own walk); <b>→ PAD</b> loads it straight onto the next empty pad — load several in a row.</li>
+          <li>Needs a connection to browse and load; once a sound is on a pad it's yours offline, saved with the project.</li>
+        </ol>
       </div>
 
       <div class="gSec">

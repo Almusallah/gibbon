@@ -4,12 +4,13 @@
 
 A personal pocket sampler and beat machine — record anything (especially the city), chop it onto pads, and work it like a classic MPC: velocity pads, timing-correct with real swing, note repeat, 16 levels, per-pad envelopes and filters, a mixer, and a song mode. Original work; the MPC workflow is emulated from the machine's documented behavior — no third-party code, ROMs, or assets. Offline, autosaves, free. (Formerly "Gibbon".)
 
-**Android:** grab `saigon-sampler.apk` from [Releases → latest](../../releases/latest) on the phone, install (allow "unknown sources" once). Updates install over the top — same signing key, projects survive. Fully offline (**no INTERNET permission**).
+**Android:** grab `saigon-sampler.apk` from [Releases → latest](../../releases/latest) on the phone, install (allow "unknown sources" once). Updates install over the top — same signing key, projects survive. Offline instrument; network is used only for the built-in **Saigon Sound Map library** (☰ → Sound Map — 259+ Saigon field recordings, searchable, load to CHOP or a pad).
 
 **iOS / iPad:** open **https://almusallah.github.io/saigon-sampler/** in Safari → Share → **Add to Home Screen**. Runs full-screen and offline, mic works, projects autosave on-device, WAV export goes through the share sheet. Same engine, same features.
 
 ## What it does
 
+- **Saigon Sound Map library** — the whole [Sound Map archive](https://saigon-soundscape.onrender.com) (259+ located Saigon field recordings) browsable in-app: search, category filter, shuffle, preview, then **→ CHOP** to slice or **→ PAD** to play. Loaded sounds are saved with the project and work offline afterwards.
 - **CHOP lab — field recording → slices**: record a walk up to **6 minutes** (or import a long file), zoom/pan the waveform, tap to audition, **AUTO-SLICE** (transient detection with sensitivity), GRID cuts, drag markers (hold to delete), **→ PADS** spreads slices across pads, full recording → WAV archive. Survives restarts.
 - **64 pads** (4 banks) — mic sampling, import, **touch velocity** (tap position = hit strength) with **FULL LEVEL** override, **NOTE REPEAT** on the timing-correct grid, **16 LEVELS** (velocity or tune −12…+3 st), **ERASE** (hold a pad while playing to strip its notes, tap while stopped to clear them).
 - **Per-pad sound**: trim, gain, pitch ±12 st + **fine ±50 ct**, pan, **attack/release envelope**, **resonant low-pass filter** with optional **velocity→filter**, one-shot/gate/loop, reverse, normalize, crop, choke groups, **POLY/MONO** voice overlap, copy/paste, keyboard mode with scales.

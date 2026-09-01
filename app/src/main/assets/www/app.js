@@ -15,7 +15,7 @@ const STEP_T = PPQ / 4;       // one 16th = 24 ticks (grid view unit)
 const TC = { '16': 24, '8': 48, '8T': 32, '16T': 16, '32': 12, '32T': 8, 'OFF': null };
 const TC_ORDER = ['16', '8', '8T', '16T', '32', '32T', 'OFF'];
 const SCALES = { chrom: [0,1,2,3,4,5,6,7,8,9,10,11], major: [0,2,4,5,7,9,11], minor: [0,2,3,5,7,8,10], pmin: [0,3,5,7,10], pmaj: [0,2,4,7,9] };
-const VERSION = 'v4.1';
+const VERSION = 'v4.2';
 
 /* ------------------------------------------------ state */
 const S = {
@@ -760,6 +760,130 @@ $('#chZoom').oninput = e => {
   drawChop();
 };
 $('#chSens').oninput = e => { $('#chSensOut').textContent = e.target.value; };
+
+/* ------------------------------------------------ Saigon Sound Map library */
+const SSM = 'https://saigon-soundscape.onrender.com/api';
+let libRows = null, libAudio = null, libPlayingBtn = null;
+
+function openLib() {
+  $('#lib').classList.add('on');
+  if (libRows) drawLib(); else loadLib();
+}
+function closeLib() {
+  $('#lib').classList.remove('on');
+  stopPreview();
+}
+$('#mLib').onclick = () => { $('#menu').classList.remove('on'); openLib(); };
+$('#chLib').onclick = openLib;
+$('#libClose').onclick = closeLib;
+
+async function loadLib() {
+  $('#libList').innerHTML = '<div id="libStatus">loading the archive…<br><small>(first load can take ~30s while the server wakes)</small></div>';
+  try {
+    const res = await fetch(SSM + '/recordings');
+    const data = await res.json();
+    libRows = data.recordings.map(r => ({
+      id: r.id, title: (r.title || 'untitled').replace(/^\[[^\]]*\]\s*/, ''),
+      cat: r.category || '', dur: r.duration || 0, desc: (r.description || '').slice(0, 120),
+    }));
+    try { localStorage.setItem('sst_lib', JSON.stringify(libRows)); } catch (e) {}
+  } catch (err) {
+    try { libRows = JSON.parse(localStorage.getItem('sst_lib')); } catch (e) {}
+    if (!libRows) {
+      $('#libList').innerHTML = '<div id="libStatus">Couldn\'t reach the Sound Map — check your connection and reopen.</div>';
+      return;
+    }
+    toast('Offline — showing the cached list (loading audio needs network)');
+  }
+  const cats = [...new Set(libRows.map(r => r.cat).filter(Boolean))].sort();
+  const sel = $('#libCat');
+  sel.innerHTML = '<option value="">all categories</option>' + cats.map(c => '<option>' + c + '</option>').join('');
+  drawLib();
+}
+
+function drawLib() {
+  const q = $('#libSearch').value.trim().toLowerCase(), cat = $('#libCat').value;
+  const rows = libRows.filter(r =>
+    (!cat || r.cat === cat) &&
+    (!q || (r.title + ' ' + r.desc + ' ' + r.cat).toLowerCase().includes(q)));
+  $('#libCount').textContent = rows.length + '/' + libRows.length;
+  const el = $('#libList'); el.innerHTML = '';
+  if (!rows.length) { el.innerHTML = '<div id="libStatus">nothing matches</div>'; return; }
+  for (const r of rows) {
+    const row = document.createElement('div'); row.className = 'libRow';
+    const info = document.createElement('div'); info.className = 'libInfo';
+    info.innerHTML = '<div class="t"></div><div class="m"></div>';
+    info.querySelector('.t').textContent = r.title;
+    info.querySelector('.m').textContent = r.cat + ' · ' + fmtTime(r.dur);
+    const pv = document.createElement('button'); pv.className = 'pv'; pv.textContent = '▶';
+    pv.onclick = () => togglePreview(r, pv);
+    const toChop = document.createElement('button'); toChop.textContent = '→ CHOP';
+    toChop.onclick = () => libLoad(r, toChop, 'chop');
+    const toPad = document.createElement('button'); toPad.textContent = '→ PAD';
+    toPad.onclick = () => libLoad(r, toPad, 'pad');
+    row.append(pv, info, toChop, toPad);
+    el.appendChild(row);
+  }
+}
+let libSearchT = 0;
+$('#libSearch').addEventListener('input', () => { clearTimeout(libSearchT); libSearchT = setTimeout(drawLib, 160); });
+$('#libCat').onchange = drawLib;
+$('#libShuffle').onclick = () => {
+  if (!libRows) return;
+  for (let i = libRows.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [libRows[i], libRows[j]] = [libRows[j], libRows[i]]; }
+  drawLib();
+};
+
+function libUrl(r) { return SSM + '/download/' + r.id.slice(0, 8); }
+function stopPreview() {
+  if (libAudio) { try { libAudio.pause(); } catch (e) {} }
+  if (libPlayingBtn) { libPlayingBtn.textContent = '▶'; libPlayingBtn.classList.remove('playing'); libPlayingBtn = null; }
+}
+function togglePreview(r, btn) {
+  if (libPlayingBtn === btn) { stopPreview(); return; }
+  stopPreview();
+  if (!libAudio) { libAudio = new Audio(); libAudio.preload = 'none'; }
+  libAudio.src = libUrl(r);
+  libAudio.play().then(() => {
+    libPlayingBtn = btn; btn.textContent = '■'; btn.classList.add('playing');
+    libAudio.onended = stopPreview;
+  }).catch(() => toast('Preview failed — check connection'));
+}
+
+async function libLoad(r, btn, dest) {
+  if (btn.disabled) return;
+  const label = btn.textContent; btn.disabled = true; btn.textContent = '…';
+  stopPreview();
+  try {
+    await ensureAudio();
+    const ab = await (await fetch(libUrl(r))).arrayBuffer();
+    const buf = await ctx.decodeAudioData(ab);
+    if (dest === 'chop') {
+      const mono = ctx.createBuffer(1, buf.length, buf.sampleRate);
+      const L = mono.getChannelData(0), a = buf.getChannelData(0);
+      const b = buf.numberOfChannels > 1 ? buf.getChannelData(1) : a;
+      for (let i = 0; i < buf.length; i++) L[i] = (a[i] + b[i]) / 2;
+      C.buf = mono; C.sr = buf.sampleRate; C.markers = []; C.z = 1; C.off = 0; C.lastTap = -1;
+      drawChop(); dirty(); saveChopSource();
+      closeLib(); gotoTab('chop');
+      $('#chopGo').classList.add('on');
+      toast('"' + r.title + '" in the chop lab');
+    } else {
+      const idx = S.pads.findIndex(p => !p.buf);
+      if (idx < 0) { toast('No empty pads'); btn.disabled = false; btn.textContent = label; return; }
+      const nb = ctx.createBuffer(2, buf.length, buf.sampleRate);
+      nb.getChannelData(0).set(buf.getChannelData(0));
+      nb.getChannelData(1).set(buf.numberOfChannels > 1 ? buf.getChannelData(1) : buf.getChannelData(0));
+      S.pads[idx] = Object.assign(newPad(), { buf: nb, name: r.title.slice(0, 24) });
+      S.selPad = idx; S.bank = Math.floor(idx / PADS_PER_BANK);
+      drawPads(); dirty();
+      toast('"' + r.title.slice(0, 20) + '" → pad ' + padLabel(idx));
+    }
+  } catch (err) {
+    toast('Load failed — check connection');
+  }
+  btn.disabled = false; btn.textContent = label;
+}
 
 /* ------------------------------------------------ WAV + export */
 function encodeWav(chL, chR, sr) {
