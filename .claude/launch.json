@@ -2,9 +2,9 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "gibbon-web",
+      "name": "saigon-web",
       "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "http.server", "8746", "--directory", "/Users/apple/Developer/gibbon/app/src/main/assets/www"],
+      "runtimeArgs": ["-m", "http.server", "8746", "--directory", "/Users/apple/Developer/saigon-sampler/app/src/main/assets/www"],
       "port": 8746
     }
   ]

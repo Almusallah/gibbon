@@ -8,26 +8,46 @@ const $$ = s => [...document.querySelectorAll(s)];
 const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 
 const NUM_BANKS = 4, PADS_PER_BANK = 16, NUM_PADS = NUM_BANKS * PADS_PER_BANK;
-const NUM_PATTERNS = 6;
+const NUM_PATTERNS = 8;       // "sequences", MPC-style
+const PPQ = 96;               // ticks per quarter note (MPC resolution)
+const STEP_T = PPQ / 4;       // one 16th = 24 ticks (grid view unit)
+/* timing correct: note value → grid size in ticks (null = OFF, record exact) */
+const TC = { '16': 24, '8': 48, '8T': 32, '16T': 16, '32': 12, '32T': 8, 'OFF': null };
+const TC_ORDER = ['16', '8', '8T', '16T', '32', '32T', 'OFF'];
 const SCALES = { chrom: [0,1,2,3,4,5,6,7,8,9,10,11], major: [0,2,4,5,7,9,11], minor: [0,2,3,5,7,8,10], pmin: [0,3,5,7,10], pmaj: [0,2,4,7,9] };
-const VERSION = 'v3';
+const VERSION = 'v4';
 
 /* ------------------------------------------------ state */
 const S = {
-  bpm: 120, swing: 0, playing: false, metro: false,
-  bank: 0, selPad: 0, pattern: 0, patLen: 16,
+  bpm: 120, swing: 50, tc: '16', playing: false, metro: false,
+  bank: 0, selPad: 0, pattern: 0,
   keys: false, scale: 'pmin',
   recArm: false, recordingPad: -1, noteRec: false,
+  fullLevel: true, noteRepeat: false, sixteen: null /* null|'vel'|'tune' */, levelsPad: 0, erase: false,
   fx: null, fxLatch: false, fxXY: { x: .5, y: .5 },
-  chain: [],
-  patterns: [], // [{len, steps:{padIdx: Uint8Array}}]
-  pads: [],     // {buf(AudioBuffer)|null, name, gain, pan, semis, mode, choke, start, end}
+  chain: [],    // [{seq, reps}]
+  patterns: [], // sequences: [{bars, events:[{t, pad, vel}]}]
+  pads: [],
+  solo: new Set(),
   clipboard: null,
   projName: 'untitled',
 };
-for (let i = 0; i < NUM_PATTERNS; i++) S.patterns.push({ len: 16, steps: {} });
+for (let i = 0; i < NUM_PATTERNS; i++) S.patterns.push(newSeq());
 for (let i = 0; i < NUM_PADS; i++) S.pads.push(newPad());
-function newPad() { return { buf: null, name: '', gain: 1, pan: 0, semis: 0, mode: 'oneshot', choke: 0, start: 0, end: 1 }; }
+function newSeq() { return { bars: 2, events: [] }; }
+function seqTicks(p) { return p.bars * 4 * PPQ; }
+function newPad() {
+  return { buf: null, name: '', gain: 1, pan: 0, semis: 0, fine: 0, mode: 'oneshot', choke: 0,
+           start: 0, end: 1, attack: 0, release: 0, cutoff: 20000, res: 0, mono: false, velFilt: false, mute: false };
+}
+/* swing: MPC-style 50–75%, shifts the offbeat of the TC pair; only for 8/16 grids */
+function swingDelayTicks(t) {
+  if (S.swing <= 50) return 0;
+  const g = TC[S.tc];
+  if (g !== 24 && g !== 48) return 0;
+  const pair = g * 2;
+  return (t % pair === g) ? Math.round(pair * (S.swing - 50) / 100) : 0;
+}
 
 /* ------------------------------------------------ audio graph */
 let ctx = null, master = {}, micStream = null, recNode = null;
@@ -64,10 +84,28 @@ class Crush extends AudioWorkletProcessor {
     return true;
   }
 }
-registerProcessor('crush', Crush);`;
+registerProcessor('crush', Crush);
+class Clock extends AudioWorkletProcessor {
+  constructor(){ super(); this.n = 0; }
+  process(){
+    this.n += 128;
+    if (this.n >= 1024) { this.n = 0; this.port.postMessage(0); } // ~23ms pump, immune to timer throttling
+    return true;
+  }
+}
+registerProcessor('clock', Clock);`;
 
+let audioInit = null;
 async function ensureAudio() {
-  if (ctx) { if (ctx.state !== 'running') await ctx.resume().catch(() => {}); return; }
+  if (audioInit) {                       // never return before the graph is fully built
+    await audioInit;
+    if (ctx.state !== 'running') await ctx.resume().catch(() => {});
+    return;
+  }
+  audioInit = buildAudio();
+  await audioInit;
+}
+async function buildAudio() {
   ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
   // iOS: contexts can be born suspended, and calls/route changes suspend them later
   if (ctx.state !== 'running') await ctx.resume().catch(() => {});
@@ -104,6 +142,13 @@ async function ensureAudio() {
   m.cap = new AudioWorkletNode(ctx, 'cap', { numberOfInputs: 1, channelCount: 2 });
   m.comp.connect(m.cap);
   m.cap.port.onmessage = e => onCapChunk(e.data);
+
+  // audio-thread clock: keeps the sequencer scheduled even when the page's
+  // timers are throttled (screen dimmed / app backgrounded while playing)
+  m.clock = new AudioWorkletNode(ctx, 'clock', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [1] });
+  const mute0 = ctx.createGain(); mute0.gain.value = 0;
+  m.clock.connect(mute0); mute0.connect(ctx.destination); // keep it pulled in the graph
+  m.clock.port.onmessage = () => { if (S.playing) schedule(); };
 }
 
 function makeIR(c, seconds) {
@@ -117,35 +162,67 @@ function makeIR(c, seconds) {
 }
 
 /* ------------------------------------------------ pad playback */
-function padSemisFor(idx, gridPos) {
-  const p = S.pads[idx];
-  if (!S.keys || gridPos === undefined) return p.semis;
-  const sc = SCALES[S.scale], row = 3 - (gridPos >> 2), deg = row * 4 + (gridPos & 3);
-  return p.semis + sc[deg % sc.length] + 12 * Math.floor(deg / sc.length);
+function gridDegree(gridPos) { return (3 - (gridPos >> 2)) * 4 + (gridPos & 3); } // bottom-left = 0
+/* semitone offset a grid position adds in the current mode (0 outside keys/16-tune) */
+function gridSemiOff(gridPos) {
+  if (gridPos === undefined) return 0;
+  if (S.sixteen === 'tune') return gridDegree(gridPos) - 12; // pads 1-16 → -12..+3 st
+  if (!S.keys) return 0;
+  const sc = SCALES[S.scale], deg = gridDegree(gridPos);
+  return sc[deg % sc.length] + 12 * Math.floor(deg / sc.length);
 }
 
-function triggerPad(idx, when = 0, gridPos = undefined, dest = null, oCtx = null) {
+/* semiOff = semitone offset baked at record/tap time (keys / 16-levels-tune),
+ * so recorded melodies survive mode toggles, reloads and offline export */
+function triggerPad(idx, when = 0, semiOff = 0, dest = null, oCtx = null, vel = 127) {
   const c = oCtx || ctx, p = S.pads[idx];
   if (!c || !p.buf) return null;
-  if (!oCtx && p.choke) {
-    for (let i = 0; i < NUM_PADS; i++) {
-      if (i !== idx && S.pads[i].choke === p.choke) stopPad(i, when || c.currentTime);
+  if (p.mute || (S.solo.size && !S.solo.has(idx))) return null;
+  const t0 = when || c.currentTime;
+  if (!oCtx) {
+    if (p.choke) for (let i = 0; i < NUM_PADS; i++) {
+      if (S.pads[i].choke === p.choke) stopPad(i, t0);
     }
-    stopPad(idx, when || c.currentTime);
+    else if (p.mono) stopPad(idx, t0);
   }
   const src = c.createBufferSource();
   src.buffer = p.buf;
-  src.playbackRate.value = Math.pow(2, padSemisFor(idx, gridPos) / 12);
+  src.playbackRate.value = Math.pow(2, (p.semis + (semiOff || 0) + p.fine / 100) / 12);
   if (p.mode === 'loop') { src.loop = true; src.loopStart = p.start * p.buf.duration; src.loopEnd = p.end * p.buf.duration; }
-  const g = c.createGain(); g.gain.value = p.gain;
+
+  const v = clamp(vel, 1, 127) / 127;
+  const level = p.gain * Math.pow(v, 1.3);
+  const g = c.createGain();
+  let head = src;
+  const wantFilter = p.cutoff < 19000 || p.res > .5 || (p.velFilt && v < 1);
+  if (wantFilter) {
+    const f = c.createBiquadFilter();
+    f.type = 'lowpass';
+    const cut = p.velFilt ? p.cutoff * (.25 + .75 * v) : p.cutoff;
+    f.frequency.value = clamp(cut, 100, 20000);
+    f.Q.value = p.res;
+    head.connect(f); head = f;
+  }
+  head.connect(g);
   const pan = c.createStereoPanner ? c.createStereoPanner() : null;
-  src.connect(g);
   if (pan) { pan.pan.value = p.pan; g.connect(pan); pan.connect(dest || master.in); }
   else g.connect(dest || master.in);
-  const t = when || c.currentTime;
-  const off = p.start * p.buf.duration, dur = (p.end - p.start) * p.buf.duration;
-  if (p.mode === 'loop') src.start(t, off);
-  else src.start(t, off, dur / src.playbackRate.value);
+
+  const dur = (p.end - p.start) * p.buf.duration / src.playbackRate.value;
+  // amp envelope: attack ramp in, optional release fade at the sample tail (one-shot)
+  if (p.attack > 0) {
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(level, t0 + p.attack / 1000);
+  } else g.gain.setValueAtTime(level, t0);
+  if (p.mode === 'oneshot' && p.release > 0) {
+    const relS = Math.min(p.release / 1000, dur * .9);
+    g.gain.setValueAtTime(level, t0 + dur - relS);
+    g.gain.linearRampToValueAtTime(0, t0 + dur);
+  }
+
+  const off = p.start * p.buf.duration;
+  if (p.mode === 'loop') src.start(t0, off);
+  else src.start(t0, off, dur * src.playbackRate.value); // 3rd arg is buffer-domain seconds
   if (!oCtx) {
     if (!activeSrc.has(idx)) activeSrc.set(idx, []);
     const rec = { src, g };
@@ -158,48 +235,109 @@ function triggerPad(idx, when = 0, gridPos = undefined, dest = null, oCtx = null
 function stopPad(idx, when) {
   const a = activeSrc.get(idx);
   if (!a) return;
+  const p = S.pads[idx];
   const t = when || (ctx ? ctx.currentTime : 0);
-  for (const r of a) { try { r.g.gain.setTargetAtTime(0, t, .01); r.src.stop(t + .05); } catch (e) {} }
+  const rel = Math.max(.01, (p.release || 0) / 1000);
+  for (const r of a) {
+    try {
+      r.g.gain.cancelScheduledValues(t);
+      r.g.gain.setTargetAtTime(0, t, rel / 3);
+      r.src.stop(t + rel + .05);
+    } catch (e) {}
+  }
   activeSrc.set(idx, []);
 }
 function stopAllPads() { for (let i = 0; i < NUM_PADS; i++) stopPad(i); }
 
-/* ------------------------------------------------ sequencer */
-let nextStepTime = 0, curStep = 0, schedTimer = 0;
+/* ------------------------------------------------ sequencer (tick engine, 96 PPQ) */
+let nextTickTime = 0, curTick = 0, schedTimer = 0, songQueue = [], songPos = 0;
 const LOOKAHEAD = 0.12, TICK = 25;
+const heldPads = new Map(); // keyed by grid element (finger) -> {idx, vel, off}; multi-touch safe
+const heldIdx = pad => { for (const h of heldPads.values()) if (h.idx === pad) return true; return false; };
 
 function stepDur() { return 60 / S.bpm / 4; }
+function tickDur() { return 60 / S.bpm / PPQ; }
+
+/* events indexed by tick for O(1) scheduling; invalidated on every edit */
+function byTick(pat) {
+  if (!pat._byTick) {
+    pat._byTick = new Map();
+    for (const ev of pat.events) {
+      if (!pat._byTick.has(ev.t)) pat._byTick.set(ev.t, []);
+      pat._byTick.get(ev.t).push(ev);
+    }
+  }
+  return pat._byTick;
+}
+function touchSeq(pat) { pat._byTick = null; }
 
 function schedule() {
-  const pat = S.patterns[S.pattern];
-  while (nextStepTime < ctx.currentTime + LOOKAHEAD) {
-    let t = nextStepTime;
-    if (curStep % 2 === 1) t += stepDur() * (S.swing / 100) * .75;
-    for (const k in pat.steps) {
-      if (pat.steps[k][curStep]) triggerPad(+k, t);
-    }
-    if (S.metro && curStep % 4 === 0) click(t, curStep % 16 === 0);
-    if (S.fx === 'gate' && gateParams.depth > 0) {
-      const div = gateParams.div, g = master.gate.gain;
-      if (curStep % div === 0) {
-        g.setValueAtTime(1, t);
-        g.setTargetAtTime(1 - gateParams.depth, t + stepDur() * div * .5, .004);
+  let pat = S.patterns[S.pattern];
+  let total = seqTicks(pat);
+  while (nextTickTime < ctx.currentTime + LOOKAHEAD) {
+    const t = nextTickTime;
+    if (curTick < 0) {
+      // count-in bar: metronome only
+      if (curTick % PPQ === 0) click(t, curTick === -4 * PPQ);
+    } else {
+      const evs = byTick(pat).get(curTick);
+      if (evs) for (const ev of evs) {
+        if (ev.skip) { const s = ev.skip; ev.skip = 0; if (t < s) continue; } // live hit already heard
+        if (S.erase && heldIdx(ev.pad)) continue; // realtime erase: skip + remove below
+        triggerPad(ev.pad, t + swingDelayTicks(ev.t) * tickDur(), ev.o, null, null, ev.vel);
       }
+      if (S.erase && heldPads.size) {
+        const before = pat.events.length;
+        pat.events = pat.events.filter(ev => !(ev.t === curTick && heldIdx(ev.pad)));
+        if (pat.events.length !== before) { touchSeq(pat); dirty(); }
+      }
+      // note repeat: retrigger held pads on the TC grid (with swing)
+      const g = TC[S.tc];
+      if (S.noteRepeat && !S.erase && g && heldPads.size && curTick % g === 0) {
+        for (const h of heldPads.values()) {
+          const when = t + swingDelayTicks(curTick) * tickDur();
+          triggerPad(h.idx, when, h.off, null, null, h.vel);
+          if (S.noteRec) insertEvent(pat, curTick, h.idx, h.vel, h.off);
+        }
+      }
+      if (S.metro && curTick % PPQ === 0) click(t, curTick % (4 * PPQ) === 0);
+      if (S.fx === 'gate' && gateParams.depth > 0) {
+        const div = gateParams.div * STEP_T;
+        if (curTick % div === 0) {
+          const gg = master.gate.gain;
+          gg.setValueAtTime(1, t);
+          gg.setTargetAtTime(1 - gateParams.depth, t + div * tickDur() * .5, .004);
+        }
+      }
+      if (curTick % STEP_T === 0) uiStep(curTick / STEP_T);
     }
-    uiStep(curStep);
-    curStep++;
-    if (curStep >= pat.len) {
-      curStep = 0;
-      if (S.playing === 'song' && S.chain.length) {
-        chainPos = (chainPos + 1) % S.chain.length;
-        S.pattern = S.chain[chainPos];
+    curTick++;
+    if (curTick >= total) {
+      curTick = 0;
+      if (S.playing === 'song' && songQueue.length) {
+        songPos = (songPos + 1) % songQueue.length;
+        S.pattern = songQueue[songPos];
+        pat = S.patterns[S.pattern]; total = seqTicks(pat); // refresh — no seam from the old sequence
+        touchSeq(pat);
         drawSeqTop(); drawSteps();
       }
     }
-    nextStepTime += stepDur();
+    nextTickTime += tickDur();
   }
 }
-let chainPos = 0;
+
+function insertEvent(pat, t, pad, vel, off) {
+  let ev = pat.events.find(e => e.t === t && e.pad === pad && (e.o || 0) === (off || 0));
+  if (ev) { ev.vel = Math.max(ev.vel, vel); }
+  else {
+    ev = { t, pad, vel };
+    if (off) ev.o = off;
+    pat.events.push(ev);
+  }
+  touchSeq(pat); dirty();
+  drawRowChips(); drawSteps();
+  return ev;
+}
 
 function click(t, accent) {
   const o = ctx.createOscillator(), g = ctx.createGain();
@@ -208,11 +346,18 @@ function click(t, accent) {
   o.connect(g); g.connect(master.out); o.start(t); o.stop(t + .05);
 }
 
+function expandChain() {
+  const q = [];
+  for (const step of S.chain) for (let r = 0; r < (step.reps || 1); r++) q.push(step.seq);
+  return q;
+}
 async function play(song = false) {
   await ensureAudio();
   S.playing = song ? 'song' : true;
-  if (song && S.chain.length) { chainPos = 0; S.pattern = S.chain[0]; }
-  curStep = 0; nextStepTime = ctx.currentTime + .06;
+  if (song && S.chain.length) { songQueue = expandChain(); songPos = 0; S.pattern = songQueue[0]; }
+  touchSeq(S.patterns[S.pattern]);
+  curTick = S.noteRec && !song ? -4 * PPQ : 0; // one-bar count-in when recording
+  nextTickTime = ctx.currentTime + .06;
   schedTimer = setInterval(schedule, TICK);
   $('#btnPlay').classList.add('on'); $('#btnPlay').textContent = '■';
   keepAwake(true);
@@ -220,6 +365,7 @@ async function play(song = false) {
 function stop() {
   S.playing = false;
   clearInterval(schedTimer);
+  heldPads.clear();
   stopAllPads();
   if (master.gate) master.gate.gain.cancelScheduledValues(0), master.gate.gain.value = 1;
   $('#btnPlay').classList.remove('on'); $('#btnPlay').textContent = '▶';
@@ -227,14 +373,26 @@ function stop() {
   if (recTarget === -1) keepAwake(false);
 }
 
-function liveRecordNote(idx) {
+function liveTickNow() {
+  return curTick - (nextTickTime - ctx.currentTime) / tickDur();
+}
+function liveRecordNote(idx, vel, off) {
   if (!S.playing || !S.noteRec) return;
-  const pat = S.patterns[S.pattern];
-  if (!pat.steps[idx]) pat.steps[idx] = new Uint8Array(64);
-  const pos = (ctx.currentTime - (nextStepTime - stepDur() * (curStep === 0 ? pat.len : curStep))) / stepDur();
-  let st = Math.round(pos) % pat.len; if (st < 0) st += pat.len;
-  pat.steps[idx][st] = 1;
-  drawRowChips(); drawSteps(); dirty();
+  const pat = S.patterns[S.pattern], total = seqTicks(pat);
+  let tick = liveTickNow();
+  const g = TC[S.tc];
+  if (g) {
+    // quantize against the SWUNG grid: snap to the gridpoint whose heard
+    // (swing-delayed) position is nearest — playback re-applies the delay
+    const a = Math.floor(tick / g) * g, b = a + g;
+    tick = (tick - a - swingDelayTicks(((a % total) + total) % total)) < (b + swingDelayTicks(((b % total) + total) % total) - tick) ? a : b;
+  } else tick = Math.round(tick);
+  if (tick < 0) return; // still in the count-in (early downbeats quantize to 0 first)
+  const ahead = tick >= curTick; // quantized forward past the scheduler pointer
+  tick = ((tick % total) + total) % total;
+  const ev = insertEvent(pat, tick, idx, vel, off);
+  // the live hit already sounded — don't let the scheduler re-fire it this pass
+  if (ahead) ev.skip = ctx.currentTime + LOOKAHEAD + .05;
 }
 
 /* ------------------------------------------------ mic recording + resample */
@@ -449,7 +607,7 @@ $('#chToPads').onclick = () => {
     const s = Math.floor(a * d.length), e = Math.floor(b * d.length);
     const nb = ctx.createBuffer(2, e - s, C.sr);
     nb.getChannelData(0).set(d.subarray(s, e)); nb.getChannelData(1).set(d.subarray(s, e));
-    Object.assign(S.pads[idx], { buf: nb, name: 'cut' + (assigned + 1), start: 0, end: 1, gain: 1, pan: 0, semis: 0, mode: 'oneshot', choke: 0 });
+    S.pads[idx] = Object.assign(newPad(), { buf: nb, name: 'cut' + (assigned + 1) });
     if (firstIdx < 0) firstIdx = idx;
     assigned++;
   }
@@ -465,7 +623,7 @@ $('#chKeep').onclick = () => {
   if (idx < 0) { toast('No empty pads'); return; }
   const d = C.buf.getChannelData(0), nb = ctx.createBuffer(2, d.length, C.sr);
   nb.getChannelData(0).set(d); nb.getChannelData(1).set(d);
-  Object.assign(S.pads[idx], { buf: nb, name: 'field ' + fmtTime(C.buf.duration), start: 0, end: 1 });
+  S.pads[idx] = Object.assign(newPad(), { buf: nb, name: 'field ' + fmtTime(C.buf.duration) });
   S.selPad = idx; drawPads(); dirty();
   toast('Full recording → pad ' + padLabel(idx));
 };
@@ -701,21 +859,22 @@ document.addEventListener('visibilitychange', () => {
 
 async function renderPatterns(patIdxList, name) {
   await ensureAudio();
+  const td = tickDur();
   let total = 0;
-  const spans = patIdxList.map(pi => { const s = S.patterns[pi].len * stepDur(); const r = { pi, at: total, len: S.patterns[pi].len }; total += s; return r; });
+  const spans = patIdxList.map(pi => {
+    const r = { pi, at: total };
+    total += seqTicks(S.patterns[pi]) * td;
+    return r;
+  });
   const sr = ctx.sampleRate, oc = new OfflineAudioContext(2, Math.ceil((total + 2) * sr), sr);
   const comp = oc.createDynamicsCompressor();
   comp.threshold.value = -12; comp.ratio.value = 4; comp.attack.value = .003; comp.release.value = .12;
   comp.connect(oc.destination);
   for (const span of spans) {
     const pat = S.patterns[span.pi];
-    for (const k in pat.steps) {
-      for (let st = 0; st < span.len; st++) {
-        if (!pat.steps[k][st]) continue;
-        let t = span.at + st * stepDur();
-        if (st % 2 === 1) t += stepDur() * (S.swing / 100) * .75;
-        triggerPad(+k, t, undefined, comp, oc);
-      }
+    for (const ev of pat.events) {
+      const t = span.at + (ev.t + swingDelayTicks(ev.t)) * td;
+      triggerPad(ev.pad, t, ev.o, comp, oc, ev.vel);
     }
   }
   toast('Rendering…');
@@ -746,15 +905,35 @@ function idb() {
 }
 function serialize() {
   return {
-    v: 2, bpm: S.bpm, swing: S.swing, chain: S.chain.slice(), patLenDefault: S.patLen,
+    v: 3, bpm: S.bpm, swing: S.swing, tc: S.tc, chain: S.chain.map(c => ({ seq: c.seq, reps: c.reps })),
     scale: S.scale, name: S.projName, chopMarkers: C.markers.slice(),
-    patterns: S.patterns.map(p => ({ len: p.len, steps: Object.fromEntries(Object.entries(p.steps).map(([k, v]) => [k, Array.from(v)])) })),
+    patterns: S.patterns.map(p => ({
+      bars: p.bars,
+      events: p.events.map(ev => [ev.t, ev.pad, ev.vel, ev.o || 0]),
+    })),
     pads: S.pads.map(p => !p.buf ? null : {
-      name: p.name, gain: p.gain, pan: p.pan, semis: p.semis, mode: p.mode, choke: p.choke,
-      start: p.start, end: p.end, sr: p.buf.sampleRate,
+      name: p.name, gain: p.gain, pan: p.pan, semis: p.semis, fine: p.fine, mode: p.mode, choke: p.choke,
+      start: p.start, end: p.end, attack: p.attack, release: p.release,
+      cutoff: p.cutoff, res: p.res, mono: p.mono, velFilt: p.velFilt, mute: p.mute,
+      sr: p.buf.sampleRate,
       L: p.buf.getChannelData(0).slice(0), R: (p.buf.numberOfChannels > 1 ? p.buf.getChannelData(1) : p.buf.getChannelData(0)).slice(0),
     }),
   };
+}
+function migrateSeq(raw) {
+  if (raw.events) {
+    return { bars: raw.bars || 2, events: raw.events.map(a => {
+      const ev = { t: a[0], pad: a[1], vel: a[2] };
+      if (a[3] && a[3] !== -1) ev.o = a[3]; // semitone offset (-1 was an old empty sentinel)
+      return ev;
+    }) };
+  }
+  // v1/v2: {len, steps:{pad: [0|1,...]}} at fixed 16th grid
+  const seq = { bars: Math.max(1, Math.round((raw.len || 16) / 16)), events: [] };
+  for (const k in (raw.steps || {})) {
+    (raw.steps[k] || []).forEach((on, st) => { if (on) seq.events.push({ t: st * STEP_T, pad: +k, vel: 100 }); });
+  }
+  return seq;
 }
 async function saveProject(key) {
   const d = await idb();
@@ -772,16 +951,26 @@ async function loadProject(key) {
   });
   if (!data) return false;
   await ensureAudio();
-  S.bpm = data.bpm; S.swing = data.swing; S.chain = data.chain || []; S.scale = data.scale || 'pmin';
+  if (S.playing) stop();
+  S.solo.clear(); takeSnapshot = null; heldPads.clear(); // no transient state bleeding across projects
+  S.bpm = data.bpm; S.scale = data.scale || 'pmin';
+  S.swing = data.swing >= 50 ? clamp(data.swing, 50, 75) : clamp(50 + Math.round((data.swing || 0) * 25 / 60), 50, 75);
+  S.tc = data.tc && TC[data.tc] !== undefined ? data.tc : '16';
+  S.chain = (data.chain || []).map(c => typeof c === 'number' ? { seq: c, reps: 1 } : c);
   S.projName = data.name || key;
   C.markers = data.chopMarkers || [];
-  S.patterns = data.patterns.map(p => ({ len: p.len, steps: Object.fromEntries(Object.entries(p.steps).map(([k, v]) => [k, Uint8Array.from(v)])) }));
-  while (S.patterns.length < NUM_PATTERNS) S.patterns.push({ len: 16, steps: {} });
+  S.patterns = data.patterns.map(migrateSeq);
+  while (S.patterns.length < NUM_PATTERNS) S.patterns.push(newSeq());
   S.pads = data.pads.map(p => {
     if (!p) return newPad();
     const buf = ctx.createBuffer(2, p.L.length, p.sr);
     buf.getChannelData(0).set(p.L); buf.getChannelData(1).set(p.R);
-    return { buf, name: p.name, gain: p.gain, pan: p.pan, semis: p.semis, mode: p.mode, choke: p.choke, start: p.start, end: p.end };
+    return Object.assign(newPad(), {
+      buf, name: p.name, gain: p.gain, pan: p.pan, semis: p.semis, fine: p.fine || 0,
+      mode: p.mode, choke: p.choke, start: p.start, end: p.end,
+      attack: p.attack || 0, release: p.release || 0, cutoff: p.cutoff || 20000, res: p.res || 0,
+      mono: !!p.mono, velFilt: !!p.velFilt, mute: !!p.mute,
+    });
   });
   while (S.pads.length < NUM_PADS) S.pads.push(newPad());
   S.pattern = 0; S.selPad = S.pads.findIndex(p => p.buf); if (S.selPad < 0) S.selPad = 0;
@@ -814,11 +1003,11 @@ function drawTopbar() {
   $('#btnRec').classList.toggle('on', S.recArm || S.recordingPad >= 0);
   $('#btnMetro').classList.toggle('on', S.metro);
 }
-$('#bpmUp').onclick = () => { S.bpm = clamp(S.bpm + 1, 40, 240); drawTopbar(); dirty(); };
-$('#bpmDown').onclick = () => { S.bpm = clamp(S.bpm - 1, 40, 240); drawTopbar(); dirty(); };
+$('#bpmUp').onclick = () => { S.bpm = clamp(S.bpm + 1, 30, 300); drawTopbar(); dirty(); };
+$('#bpmDown').onclick = () => { S.bpm = clamp(S.bpm - 1, 30, 300); drawTopbar(); dirty(); };
 let holdIv = 0;
 for (const [id, d] of [['#bpmUp', 1], ['#bpmDown', -1]]) {
-  $(id).addEventListener('pointerdown', () => { holdIv = setInterval(() => { S.bpm = clamp(S.bpm + d, 40, 240); drawTopbar(); }, 90); });
+  $(id).addEventListener('pointerdown', () => { holdIv = setInterval(() => { S.bpm = clamp(S.bpm + d, 30, 300); drawTopbar(); }, 90); });
   $(id).addEventListener('pointerup', () => { clearInterval(holdIv); dirty(); });
   $(id).addEventListener('pointerleave', () => clearInterval(holdIv));
   $(id).addEventListener('pointercancel', () => clearInterval(holdIv));
@@ -829,7 +1018,7 @@ $('#btnTap').onclick = () => {
   taps = taps.filter(t => now - t < 3000); taps.push(now);
   if (taps.length >= 3) {
     const iv = (taps[taps.length - 1] - taps[0]) / (taps.length - 1);
-    S.bpm = clamp(Math.round(60000 / iv), 40, 240); drawTopbar(); dirty();
+    S.bpm = clamp(Math.round(60000 / iv), 30, 300); drawTopbar(); dirty();
   }
 };
 $('#btnMetro').onclick = () => { S.metro = !S.metro; drawTopbar(); };
@@ -851,6 +1040,7 @@ $$('.tab').forEach(t => t.onclick = () => {
   if (t.dataset.page === 'edit') drawEdit();
   if (t.dataset.page === 'seq') { drawSeqTop(); drawRowChips(); drawSteps(); }
   if (t.dataset.page === 'chop') drawChop();
+  if (t.dataset.page === 'mix') drawMix();
 });
 function gotoTab(name) { $$('.tab').find(t => t.dataset.page === name).click(); }
 
@@ -859,7 +1049,7 @@ const bankRow = $('#bankRow'), padGrid = $('#padGrid');
 for (let b = 0; b < NUM_BANKS; b++) {
   const el = document.createElement('div');
   el.className = 'bank'; el.textContent = 'BANK ' + 'ABCD'[b];
-  el.onclick = () => { S.bank = b; drawPads(); };
+  el.onclick = () => { S.bank = b; drawPads(); if ($('#page-mix').classList.contains('on')) drawMix(); };
   bankRow.appendChild(el);
 }
 const padEls = [];
@@ -867,26 +1057,63 @@ for (let i = 0; i < PADS_PER_BANK; i++) {
   const el = document.createElement('div');
   el.className = 'pad'; el.innerHTML = '<span class="lbl"></span><span class="num"></span>';
   padGrid.appendChild(el); padEls.push(el);
-  let lpTimer = 0, played = false;
+  let lpTimer = 0, played = false, playedIdx = -1;
   el.addEventListener('pointerdown', async ev => {
-    ev.preventDefault(); played = false;
+    ev.preventDefault(); played = false; playedIdx = -1;
     await ensureAudio();
-    const idx = S.bank * PADS_PER_BANK + i;
-    lpTimer = setTimeout(() => { lpTimer = 0; S.selPad = idx; drawPads(); gotoTab('edit'); }, 480);
+    let idx = S.bank * PADS_PER_BANK + i;
+    const perfMode = S.noteRepeat || S.erase || S.sixteen || S.keys;
+    if (!perfMode) lpTimer = setTimeout(() => { lpTimer = 0; S.selPad = idx; drawPads(); gotoTab('edit'); }, 480);
     if (S.recArm && S.recordingPad < 0) { clearTimeout(lpTimer); lpTimer = 0; startMicRecording(idx); return; }
     if (S.recordingPad === idx) { clearTimeout(lpTimer); lpTimer = 0; stopRecording(); return; }
+
+    // touch velocity: lower on the pad = harder hit (FULL LVL overrides)
+    let vel = 127;
+    if (!S.fullLevel) {
+      const r = el.getBoundingClientRect();
+      vel = Math.round(clamp(30 + 97 * (ev.clientY - r.top) / r.height, 30, 127));
+    }
+    let off = 0;
+    if (S.sixteen) {
+      idx = S.levelsPad;
+      off = gridSemiOff(i);
+      if (S.sixteen === 'vel') vel = (gridDegree(i) + 1) * 8 - 1; // levels 1-16 → vel 7..127
+    } else if (S.keys) { idx = S.selPad; off = gridSemiOff(i); }
+
     const p = S.pads[idx];
-    if (!p.buf) { S.selPad = idx; drawPads(); return; }
-    S.selPad = idx; played = true;
+    if (!p.buf) { if (!S.sixteen && !S.keys) { S.selPad = idx; drawPads(); } return; }
+
+    if (S.erase) {
+      heldPads.set(i, { idx, vel, off });
+      playedIdx = idx;
+      if (!S.playing) {
+        const pat = S.patterns[S.pattern];
+        const before = pat.events.length;
+        pat.events = pat.events.filter(e2 => e2.pad !== idx);
+        touchSeq(pat);
+        if (pat.events.length !== before) { dirty(); drawRowChips(); drawSteps(); toast('Erased ' + padLabel(idx)); }
+      }
+      return;
+    }
+
+    if (!S.sixteen && !S.keys) S.selPad = idx;
+    played = true; playedIdx = idx;
+    heldPads.set(i, { idx, vel, off });
     if (p.mode === 'loop' && activeSrc.get(idx) && activeSrc.get(idx).length) { stopPad(idx); drawPads(); return; }
-    triggerPad(idx, 0, S.keys ? i : undefined);
-    liveRecordNote(idx);
+
+    if (S.noteRepeat && S.playing && TC[S.tc]) {
+      // repeat mode while running: the scheduler fires it on the next grid point
+    } else {
+      triggerPad(idx, 0, off, null, null, vel);
+      liveRecordNote(idx, vel, off);
+    }
     el.classList.add('lit'); setTimeout(() => el.classList.remove('lit'), 130);
     drawPads();
   });
   const up = () => {
     if (lpTimer) { clearTimeout(lpTimer); lpTimer = 0; }
-    const idx = S.bank * PADS_PER_BANK + i;
+    const idx = playedIdx >= 0 ? playedIdx : S.bank * PADS_PER_BANK + i;
+    heldPads.delete(i);
     if (played && S.pads[idx].mode === 'gate') stopPad(idx);
   };
   el.addEventListener('pointerup', up);
@@ -894,6 +1121,31 @@ for (let i = 0; i < PADS_PER_BANK; i++) {
   el.addEventListener('pointercancel', up);
 }
 function padLabel(idx) { return 'ABCD'[Math.floor(idx / PADS_PER_BANK)] + (idx % PADS_PER_BANK + 1); }
+
+/* ---- performance toggles (MPC-style) ---- */
+function drawPerf() {
+  $('#pFull').classList.toggle('on', S.fullLevel);
+  $('#pRepeat').classList.toggle('on', S.noteRepeat);
+  $('#pLevels').classList.toggle('on', !!S.sixteen);
+  $('#pLevels').textContent = S.sixteen === 'vel' ? '16 LVL·VEL' : S.sixteen === 'tune' ? '16 LVL·TUNE' : '16 LEVELS';
+  $('#pErase').classList.toggle('on', S.erase);
+}
+$('#pFull').onclick = () => { S.fullLevel = !S.fullLevel; drawPerf(); };
+$('#pRepeat').onclick = () => {
+  S.noteRepeat = !S.noteRepeat;
+  if (S.noteRepeat && !TC[S.tc]) toast('Note repeat follows TC — set TC on the SEQ page');
+  drawPerf();
+};
+$('#pLevels').onclick = () => {
+  S.sixteen = S.sixteen === null ? 'vel' : S.sixteen === 'vel' ? 'tune' : null;
+  if (S.sixteen) { S.levelsPad = S.selPad; S.keys = false; toast('Pads = 16 ' + (S.sixteen === 'vel' ? 'velocity' : 'tune') + ' levels of ' + padLabel(S.levelsPad)); }
+  drawPerf(); drawPads();
+};
+$('#pErase').onclick = () => {
+  S.erase = !S.erase;
+  toast(S.erase ? (S.playing ? 'Hold a pad to erase its notes as they pass' : 'Tap a pad to erase its notes in this sequence') : 'Erase off');
+  drawPerf();
+};
 function drawPads() {
   $$('.bank').forEach((el, b) => el.classList.toggle('on', b === S.bank));
   for (let i = 0; i < PADS_PER_BANK; i++) {
@@ -907,37 +1159,96 @@ function drawPads() {
 }
 
 /* ------------------------------------------------ UI: sequencer */
+let takeSnapshot = null;
 function drawSeqTop() {
   const el = $('#seqTop'); el.innerHTML = '';
   for (let i = 0; i < NUM_PATTERNS; i++) {
     const b = document.createElement('button');
     b.className = 'patBtn' + (i === S.pattern ? ' on' : '');
-    b.textContent = 'P' + (i + 1);
-    b.onclick = () => { S.pattern = i; curStep = 0; drawSeqTop(); drawRowChips(); drawSteps(); };
+    b.textContent = 'S' + (i + 1);
+    b.onclick = () => { S.pattern = i; curTick = 0; touchSeq(S.patterns[i]); drawSeqTop(); drawRowChips(); drawSteps(); };
+    // long-press a slot: copy the current sequence into it (MPC copy-sequence)
+    let cpTimer = 0;
+    b.addEventListener('pointerdown', () => {
+      if (i === S.pattern) return;
+      cpTimer = setTimeout(() => {
+        cpTimer = 0;
+        const src = S.patterns[S.pattern], old = S.patterns[i];
+        takeSnapshot = { seq: i, events: old.events, bars: old.bars }; // UNDO on that slot restores it
+        S.patterns[i] = { bars: src.bars, events: src.events.map(ev => ({ ...ev })) };
+        toast('S' + (S.pattern + 1) + ' copied → S' + (i + 1) + ' (UNDO there restores)');
+        dirty();
+      }, 550);
+    });
+    for (const evName of ['pointerup', 'pointerleave', 'pointercancel'])
+      b.addEventListener(evName, () => { if (cpTimer) { clearTimeout(cpTimer); cpTimer = 0; } });
     el.appendChild(b);
   }
-  const len = document.createElement('button');
-  len.className = 'seq-ctl'; len.textContent = S.patterns[S.pattern].len + ' steps';
-  len.onclick = () => {
-    const p = S.patterns[S.pattern];
-    p.len = p.len === 16 ? 32 : p.len === 32 ? 64 : 16;
-    for (const k in p.steps) { if (p.steps[k].length < 64) { const n = new Uint8Array(64); n.set(p.steps[k]); p.steps[k] = n; } }
-    curStep = 0; drawSeqTop(); drawSteps(); dirty();
+  const pat = S.patterns[S.pattern];
+  const bars = document.createElement('button');
+  bars.className = 'seq-ctl'; bars.textContent = pat.bars + (pat.bars === 1 ? ' BAR' : ' BARS');
+  bars.onclick = () => {
+    pat.bars = { 1: 2, 2: 4, 4: 8, 8: 1 }[pat.bars];
+    const total = seqTicks(pat);
+    pat.events = pat.events.filter(ev => ev.t < total);
+    touchSeq(pat); curTick = 0;
+    drawSeqTop(); drawSteps(); dirty();
   };
-  el.appendChild(len);
+  el.appendChild(bars);
+  const tc = document.createElement('button');
+  tc.className = 'seq-ctl'; tc.textContent = 'TC ' + (S.tc === 'OFF' ? 'OFF' : '1/' + S.tc);
+  tc.onclick = () => {
+    S.tc = TC_ORDER[(TC_ORDER.indexOf(S.tc) + 1) % TC_ORDER.length];
+    drawSeqTop(); dirty();
+  };
+  el.appendChild(tc);
   const rec = document.createElement('button');
-  rec.className = 'seq-ctl' + (S.noteRec ? ' on' : ''); rec.textContent = '● REC NOTES';
-  rec.onclick = () => { S.noteRec = !S.noteRec; drawSeqTop(); };
+  rec.className = 'seq-ctl' + (S.noteRec ? ' on' : ''); rec.textContent = '● REC';
+  rec.onclick = () => {
+    S.noteRec = !S.noteRec;
+    if (S.noteRec) takeSnapshot = { seq: S.pattern, events: pat.events.map(ev => ({ ...ev })), bars: pat.bars };
+    drawSeqTop();
+  };
   el.appendChild(rec);
+  const undo = document.createElement('button');
+  undo.className = 'seq-ctl'; undo.textContent = 'UNDO';
+  undo.onclick = () => {
+    if (!takeSnapshot || takeSnapshot.seq !== S.pattern) { toast('Nothing to undo here'); return; }
+    // MPC-style: UNDO toggles between the take and the state before it
+    const p = S.patterns[S.pattern];
+    const curEv = p.events, curBars = p.bars;
+    p.events = takeSnapshot.events;
+    if (takeSnapshot.bars) p.bars = takeSnapshot.bars;
+    takeSnapshot.events = curEv; takeSnapshot.bars = curBars;
+    touchSeq(p);
+    drawSeqTop(); drawRowChips(); drawSteps(); dirty(); toast('Take toggled — UNDO again to swap back');
+  };
+  el.appendChild(undo);
+  const dup = document.createElement('button');
+  dup.className = 'seq-ctl'; dup.textContent = 'DUP×2';
+  dup.onclick = () => {
+    // classic bar-copy: double the bars and copy all events into the new half
+    if (pat.bars >= 8) { toast('Max 8 bars'); return; }
+    const len = seqTicks(pat);
+    pat.events = pat.events.concat(pat.events.map(ev => ({ ...ev, t: ev.t + len })));
+    pat.bars *= 2;
+    touchSeq(pat); drawSeqTop(); drawSteps(); dirty();
+    toast(pat.bars / 2 + ' bar' + (pat.bars > 2 ? 's' : '') + ' copied → ' + pat.bars + ' bars');
+  };
+  el.appendChild(dup);
   const clr = document.createElement('button');
-  clr.className = 'seq-ctl'; clr.textContent = 'CLEAR PAT';
-  clr.onclick = () => { S.patterns[S.pattern].steps = {}; drawRowChips(); drawSteps(); dirty(); };
+  clr.className = 'seq-ctl'; clr.textContent = 'CLEAR';
+  clr.onclick = () => {
+    takeSnapshot = { seq: S.pattern, events: pat.events.map(ev => ({ ...ev })), bars: pat.bars };
+    pat.events = []; touchSeq(pat);
+    drawRowChips(); drawSteps(); dirty();
+  };
   el.appendChild(clr);
 }
 function drawRowChips() {
   const el = $('#rowChips'); el.innerHTML = '';
   const pat = S.patterns[S.pattern];
-  const idxs = new Set(Object.keys(pat.steps).map(Number).filter(k => pat.steps[k].some(v => v)));
+  const idxs = new Set(pat.events.map(ev => ev.pad));
   idxs.add(S.selPad);
   [...idxs].sort((a, b) => a - b).forEach(idx => {
     const c = document.createElement('button');
@@ -950,29 +1261,66 @@ function drawRowChips() {
 function drawSteps() {
   const el = $('#stepWrap'); el.innerHTML = '';
   const pat = S.patterns[S.pattern];
-  if (!pat.steps[S.selPad]) pat.steps[S.selPad] = new Uint8Array(64);
-  const arr = pat.steps[S.selPad];
-  for (let r = 0; r < pat.len / 8; r++) {
+  const steps = pat.bars * 16;
+  for (let r = 0; r < steps / 8; r++) {
     const row = document.createElement('div'); row.className = 'stepRow';
     for (let c = 0; c < 8; c++) {
       const st = r * 8 + c, s = document.createElement('div');
-      s.className = 'step' + (st % 4 === 0 ? ' beat' : '') + (arr[st] ? ' on' : '');
+      const t0 = st * STEP_T, t1 = t0 + STEP_T;
+      const cell = pat.events.filter(ev => ev.pad === S.selPad && ev.t >= t0 && ev.t < t1);
+      s.className = 'step' + (st % 4 === 0 ? ' beat' : '') + (cell.length ? ' on' : '');
+      if (cell.length) s.style.opacity = .45 + .55 * Math.max(...cell.map(ev => ev.vel)) / 127;
       s.dataset.st = st;
-      s.onclick = () => { arr[st] = arr[st] ? 0 : 1; s.classList.toggle('on', !!arr[st]); drawRowChips(); dirty(); };
+      s.onclick = () => {
+        const hit = pat.events.filter(ev => ev.pad === S.selPad && ev.t >= t0 && ev.t < t1);
+        if (hit.length) pat.events = pat.events.filter(ev => !hit.includes(ev));
+        else pat.events.push({ t: t0, pad: S.selPad, vel: 100 });
+        touchSeq(pat); dirty();
+        drawRowChips(); drawSteps();
+      };
       row.appendChild(s);
     }
     el.appendChild(row);
   }
 }
+let seqTouchT = 0;
+$('#stepWrap').addEventListener('pointerdown', () => { seqTouchT = performance.now(); }, { passive: true });
 function uiStep(st) {
   if (!$('#page-seq').classList.contains('on')) return;
   requestAnimationFrame(() => {
     $$('.step.cur').forEach(e => e.classList.remove('cur'));
     const el = document.querySelector('.step[data-st="' + st + '"]');
-    if (el) el.classList.add('cur');
+    if (el) {
+      el.classList.add('cur');
+      // follow the playhead on long sequences, but not while the user is editing
+      if (performance.now() - seqTouchT > 1500) el.scrollIntoView({ block: 'nearest' });
+    }
   });
 }
 $('#swing').oninput = e => { S.swing = +e.target.value; $('#swingOut').textContent = S.swing + '%'; dirty(); };
+
+/* ------------------------------------------------ UI: mixer */
+function drawMix() {
+  const el = $('#mixWrap'); el.innerHTML = '';
+  for (let i = 0; i < PADS_PER_BANK; i++) {
+    const idx = S.bank * PADS_PER_BANK + i, p = S.pads[idx];
+    const row = document.createElement('div'); row.className = 'mixRow';
+    const lbl = document.createElement('div'); lbl.className = 'mLbl';
+    lbl.textContent = padLabel(idx) + (p.name ? ' ' + p.name.slice(0, 8) : '');
+    lbl.style.color = p.buf ? 'var(--txt)' : 'var(--dim)';
+    const lv = document.createElement('input'); lv.type = 'range'; lv.min = 0; lv.max = 150; lv.value = Math.round(p.gain * 100);
+    lv.oninput = () => { p.gain = lv.value / 100; dirty(); };
+    const pn = document.createElement('input'); pn.type = 'range'; pn.min = -100; pn.max = 100; pn.value = Math.round(p.pan * 100);
+    pn.style.maxWidth = '70px';
+    pn.oninput = () => { p.pan = pn.value / 100; dirty(); };
+    const m = document.createElement('button'); m.className = 'mBtn' + (p.mute ? ' mOn' : ''); m.textContent = 'M';
+    m.onclick = () => { p.mute = !p.mute; if (p.mute) stopPad(idx); m.classList.toggle('mOn', p.mute); dirty(); };
+    const s = document.createElement('button'); s.className = 'mBtn' + (S.solo.has(idx) ? ' sOn' : ''); s.textContent = 'S';
+    s.onclick = () => { S.solo.has(idx) ? S.solo.delete(idx) : S.solo.add(idx); drawMix(); };
+    row.append(lbl, lv, pn, m, s);
+    el.appendChild(row);
+  }
+}
 
 /* ------------------------------------------------ UI: FX */
 const FX = {
@@ -1011,7 +1359,7 @@ function applyFx() {
   fast(m.dSend.gain, 0); fast(m.rSend.gain, 0);
   m.crush.port.postMessage({ wet: 0 });
   gateParams.depth = 0;
-  if (!S.playing) { m.gate.gain.cancelScheduledValues(t); fast(m.gate.gain, 1); }
+  m.gate.gain.cancelScheduledValues(t); fast(m.gate.gain, 1); // always release the gate, playing or not
   switch (S.fx) {
     case 'lpf': fast(m.lp.frequency, 80 * Math.pow(250, x)); fast(m.lp.Q, .7 + (1 - y) * 11); break;
     case 'hpf': fast(m.hp.frequency, 40 * Math.pow(250, x)); fast(m.hp.Q, .7 + (1 - y) * 11); break;
@@ -1050,9 +1398,18 @@ function drawEdit() {
   $('#editMeta').textContent = p.buf ? p.buf.duration.toFixed(2) + 's @ ' + p.buf.sampleRate + 'Hz' : '';
   $('#cGain').value = Math.round(p.gain * 100); $('#oGain').textContent = Math.round(p.gain * 100) + '%';
   $('#cPitch').value = p.semis; $('#oPitch').textContent = p.semis + ' st';
+  $('#cFine').value = p.fine; $('#oFine').textContent = p.fine + ' ct';
   $('#cPan').value = Math.round(p.pan * 100); $('#oPan').textContent = p.pan === 0 ? 'C' : (p.pan < 0 ? 'L' : 'R') + Math.abs(Math.round(p.pan * 100));
+  $('#cAtk').value = p.attack; $('#oAtk').textContent = p.attack + 'ms';
+  $('#cRel').value = p.release; $('#oRel').textContent = p.release + 'ms';
+  $('#cCut').value = cutToSlider(p.cutoff); $('#oCut').textContent = p.cutoff >= 19000 ? 'off' : (p.cutoff >= 1000 ? (p.cutoff / 1000).toFixed(1) + 'k' : Math.round(p.cutoff));
+  $('#cRes').value = Math.round(p.res * 10); $('#oRes').textContent = p.res.toFixed(1);
   $('#bMode').textContent = { oneshot: 'ONE-SHOT', gate: 'GATE', loop: 'LOOP' }[p.mode];
   $('#bChoke').textContent = 'CHOKE: ' + (p.choke ? p.choke : '–');
+  $('#bMono').textContent = p.mono ? 'MONO' : 'POLY';
+  $('#bMono').classList.toggle('on', p.mono);
+  $('#bVelFilt').textContent = 'VEL→FILT: ' + (p.velFilt ? 'ON' : 'OFF');
+  $('#bVelFilt').classList.toggle('on', p.velFilt);
   $('#bKeys').textContent = 'KEYBOARD MODE: ' + (S.keys ? 'ON' : 'OFF');
   $('#bKeys').classList.toggle('on', S.keys);
   $('#selScale').value = S.scale;
@@ -1105,8 +1462,21 @@ function moveHandle(x) {
   else p.end = Math.max(x, p.start + .005);
   drawWave();
 }
+/* filter slider is log-scaled: 0..100 → 200Hz..20kHz (100 = off) */
+const sliderToCut = v => v >= 100 ? 20000 : Math.round(200 * Math.pow(100, v / 100));
+const cutToSlider = c => c >= 19000 ? 100 : Math.round(Math.log(c / 200) / Math.log(100) * 100);
 $('#cGain').oninput = e => { S.pads[S.selPad].gain = e.target.value / 100; $('#oGain').textContent = e.target.value + '%'; dirty(); };
 $('#cPitch').oninput = e => { S.pads[S.selPad].semis = +e.target.value; $('#oPitch').textContent = e.target.value + ' st'; dirty(); };
+$('#cFine').oninput = e => { S.pads[S.selPad].fine = +e.target.value; $('#oFine').textContent = e.target.value + ' ct'; dirty(); };
+$('#cAtk').oninput = e => { S.pads[S.selPad].attack = +e.target.value; $('#oAtk').textContent = e.target.value + 'ms'; dirty(); };
+$('#cRel').oninput = e => { S.pads[S.selPad].release = +e.target.value; $('#oRel').textContent = e.target.value + 'ms'; dirty(); };
+$('#cCut').oninput = e => {
+  const p = S.pads[S.selPad]; p.cutoff = sliderToCut(+e.target.value);
+  $('#oCut').textContent = p.cutoff >= 19000 ? 'off' : (p.cutoff >= 1000 ? (p.cutoff / 1000).toFixed(1) + 'k' : Math.round(p.cutoff)); dirty();
+};
+$('#cRes').oninput = e => { const p = S.pads[S.selPad]; p.res = e.target.value / 10; $('#oRes').textContent = p.res.toFixed(1); dirty(); };
+$('#bMono').onclick = () => { const p = S.pads[S.selPad]; p.mono = !p.mono; drawEdit(); dirty(); };
+$('#bVelFilt').onclick = () => { const p = S.pads[S.selPad]; p.velFilt = !p.velFilt; drawEdit(); dirty(); };
 $('#cPan').oninput = e => { const p = S.pads[S.selPad]; p.pan = e.target.value / 100; $('#oPan').textContent = p.pan === 0 ? 'C' : (p.pan < 0 ? 'L' : 'R') + Math.abs(e.target.value); dirty(); };
 $('#bMode').onclick = () => { const p = S.pads[S.selPad]; p.mode = { oneshot: 'gate', gate: 'loop', loop: 'oneshot' }[p.mode]; drawEdit(); dirty(); };
 $('#bChoke').onclick = () => { const p = S.pads[S.selPad]; p.choke = (p.choke + 1) % 5; drawEdit(); dirty(); };
@@ -1140,7 +1510,13 @@ $('#bCopy').onclick = () => {
 };
 $('#bPaste').onclick = () => {
   if (!S.clipboard) { toast('Clipboard empty'); return; }
-  S.pads[S.selPad] = { ...S.clipboard };
+  const src = S.clipboard;
+  const np = { ...src };
+  if (src.buf) { // deep-copy so destructive edits (reverse/crop/normalize) stay per-pad
+    np.buf = ctx.createBuffer(src.buf.numberOfChannels, src.buf.length, src.buf.sampleRate);
+    for (let c = 0; c < src.buf.numberOfChannels; c++) np.buf.getChannelData(c).set(src.buf.getChannelData(c));
+  }
+  S.pads[S.selPad] = np;
   drawPads(); drawEdit(); dirty(); toast('Pasted → ' + padLabel(S.selPad));
 };
 $('#bClear').onclick = () => {
@@ -1148,7 +1524,12 @@ $('#bClear').onclick = () => {
   S.pads[S.selPad] = newPad();
   drawPads(); drawEdit(); dirty(); toast('Cleared ' + padLabel(S.selPad));
 };
-$('#bKeys').onclick = () => { S.keys = !S.keys; drawEdit(); toast(S.keys ? 'Pads now play ' + padLabel(S.selPad) + ' chromatically' : 'Pads back to normal'); };
+$('#bKeys').onclick = () => {
+  S.keys = !S.keys;
+  if (S.keys) S.sixteen = null;
+  drawEdit(); drawPerf();
+  toast(S.keys ? 'Pads now play ' + padLabel(S.selPad) + ' chromatically' : 'Pads back to normal');
+};
 $('#selScale').onchange = e => { S.scale = e.target.value; dirty(); };
 
 /* ------------------------------------------------ UI: menu */
@@ -1175,26 +1556,39 @@ $('#mSave').onclick = async () => { await ensureAudio(); await saveProject(S.pro
 $('#mNew').onclick = () => {
   stop();
   S.pads = []; for (let i = 0; i < NUM_PADS; i++) S.pads.push(newPad());
-  S.patterns = []; for (let i = 0; i < NUM_PATTERNS; i++) S.patterns.push({ len: 16, steps: {} });
-  S.chain = []; S.pattern = 0; S.selPad = 0; S.projName = 'untitled';
+  S.patterns = []; for (let i = 0; i < NUM_PATTERNS; i++) S.patterns.push(newSeq());
+  S.chain = []; S.solo.clear(); S.pattern = 0; S.selPad = 0; S.projName = 'untitled';
   drawAll(); $('#menu').classList.remove('on'); toast('New project');
 };
 $('#mExportLoop').onclick = () => { $('#menu').classList.remove('on'); renderPatterns([S.pattern], safeName(S.projName) + '-loop.wav'); };
 $('#mExportSong').onclick = () => {
-  if (!S.chain.length) { toast('Chain is empty — tap patterns below first'); return; }
+  if (!S.chain.length) { toast('Song is empty — tap sequences below first'); return; }
   $('#menu').classList.remove('on');
-  renderPatterns(S.chain, safeName(S.projName) + '-song.wav');
+  renderPatterns(expandChain(), safeName(S.projName) + '-song.wav');
 };
 $('#mExportPad').onclick = () => { $('#menu').classList.remove('on'); exportPad(); };
 $('#mResample').onclick = async () => { await ensureAudio(); $('#menu').classList.remove('on'); startResample(); };
+$('#mPlaySong').onclick = async () => {
+  if (!S.chain.length) { toast('Song is empty — tap sequences below first'); return; }
+  if (S.playing) stop();
+  $('#menu').classList.remove('on');
+  await play(true);
+};
 function drawChain() {
   const row = $('#chainRow'); row.innerHTML = '';
   for (let i = 0; i < NUM_PATTERNS; i++) {
-    const b = document.createElement('button'); b.className = 'patBtn'; b.textContent = 'P' + (i + 1);
-    b.onclick = () => { S.chain.push(i); drawChain(); dirty(); };
+    const b = document.createElement('button'); b.className = 'patBtn'; b.textContent = 'S' + (i + 1);
+    b.onclick = () => {
+      const last = S.chain[S.chain.length - 1];
+      if (last && last.seq === i) last.reps++;    // tapping the same seq again = more repeats
+      else S.chain.push({ seq: i, reps: 1 });
+      drawChain(); dirty();
+    };
     row.appendChild(b);
   }
-  $('#chainView').textContent = S.chain.length ? 'chain: ' + S.chain.map(i => 'P' + (i + 1)).join(' → ') : 'chain: (empty)';
+  $('#chainView').textContent = S.chain.length
+    ? 'song: ' + S.chain.map(c => 'S' + (c.seq + 1) + (c.reps > 1 ? '×' + c.reps : '')).join(' → ')
+    : 'song: (empty)';
 }
 $('#mChainClear').onclick = () => { S.chain = []; drawChain(); dirty(); };
 
@@ -1205,7 +1599,8 @@ function toast(msg) {
   clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('on'), 2200);
 }
 function drawAll() {
-  drawTopbar(); drawPads(); drawSeqTop(); drawRowChips(); drawSteps(); drawEdit(); drawFx();
+  drawTopbar(); drawPads(); drawPerf(); drawSeqTop(); drawRowChips(); drawSteps(); drawEdit(); drawFx();
+  if ($('#page-mix').classList.contains('on')) drawMix();
   $('#swing').value = S.swing; $('#swingOut').textContent = S.swing + '%';
 }
 window.addEventListener('resize', drawWave);
@@ -1231,4 +1626,6 @@ window.__g = {
   get S() { return S; }, get ctx() { return ctx; }, get C() { return C; },
   ensureAudio, triggerPad, drawPads, drawEdit, drawAll, renderPatterns, saveProject, loadProject, dirty,
   drawChop, autoSlice, auditionAt, saveChopSource, loadChopSource,
+  insertEvent, liveTickNow, expandChain, migrateSeq, touchSeq, drawSteps, drawSeqTop, drawMix, drawPerf,
+  get curTick() { return curTick; }, TC, PPQ, STEP_T, swingDelayTicks, seqTicks,
 };

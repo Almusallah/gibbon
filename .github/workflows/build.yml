@@ -31,11 +31,11 @@ jobs:
       - name: Build signed release APK
         run: gradle assembleRelease -PverCode=${{ github.run_number }}
       - name: Stage artifact
-        run: cp app/build/outputs/apk/release/app-release.apk gibbon.apk
+        run: cp app/build/outputs/apk/release/app-release.apk saigon-sampler.apk
       - name: Publish to the "latest" release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: Gibbon (latest)
+          name: Saigon Sampler (latest)
           body: "Signed APK — download on the phone and install (allow 'unknown sources' once). Build #${{ github.run_number }}."
-          files: gibbon.apk
+          files: saigon-sampler.apk
