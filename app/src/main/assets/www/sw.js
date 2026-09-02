@@ -1,6 +1,6 @@
 /* Gibbon service worker — network-first (with a short timeout) so updates land
  * immediately, cache fallback so the instrument works fully offline. */
-const CACHE = 'saigon-v4-2';
+const CACHE = 'saigon-v4-2-1';
 const CORE = ['./', 'app.js', 'manifest.webmanifest',
               'icon-192.png', 'icon-512.png', 'icon-180.png'];
 const NET_TIMEOUT_MS = 3500;

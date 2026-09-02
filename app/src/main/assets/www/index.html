@@ -42,6 +42,19 @@
   #bpmVal{font-variant-numeric:tabular-nums;font-size:15px;font-weight:700;min-width:44px;text-align:center;}
   #bpmVal small{color:var(--dim);font-weight:400;}
 
+  /* compact top bar on phone widths — every control must stay on screen */
+  @media (max-width: 480px){
+    #topbar{gap:4px;padding:6px 8px;}
+    #logo span{display:none;}
+    #logo{font-size:12px;letter-spacing:.08em;}
+    .tb-btn{padding:8px 6px;min-width:30px;font-size:13px;border-radius:7px;}
+    #btnTap{font-size:10px;padding:9px 5px;}
+    #bpmVal{min-width:32px;font-size:13px;}
+    #bpmVal small{display:none;}
+    #bpmBox{gap:1px;}
+    .tab{font-size:11px;padding:9px 0;letter-spacing:.04em;}
+  }
+
   /* ---------- tabs ---------- */
   #tabs{display:flex;background:var(--panel);border-bottom:1px solid var(--line);}
   .tab{flex:1;text-align:center;padding:10px 0;font-size:13px;font-weight:700;letter-spacing:.08em;color:var(--dim);border-bottom:2px solid transparent;}

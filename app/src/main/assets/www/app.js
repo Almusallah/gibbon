@@ -15,7 +15,7 @@ const STEP_T = PPQ / 4;       // one 16th = 24 ticks (grid view unit)
 const TC = { '16': 24, '8': 48, '8T': 32, '16T': 16, '32': 12, '32T': 8, 'OFF': null };
 const TC_ORDER = ['16', '8', '8T', '16T', '32', '32T', 'OFF'];
 const SCALES = { chrom: [0,1,2,3,4,5,6,7,8,9,10,11], major: [0,2,4,5,7,9,11], minor: [0,2,3,5,7,8,10], pmin: [0,3,5,7,10], pmaj: [0,2,4,7,9] };
-const VERSION = 'v4.2';
+const VERSION = 'v4.2.1';
 
 /* ------------------------------------------------ state */
 const S = {
